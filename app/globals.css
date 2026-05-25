@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+/*
+ * Satoshi (the brand sans used on ruh.ai) is loaded from Fontshare via
+ * a <link rel="stylesheet"> in app/layout.tsx <head>, NOT via @import here.
+ * Reason: Tailwind v4 expands its own @import inline at the top of the
+ * compiled CSS, which means any @import after it violates the CSS spec
+ * "all @imports must come first" rule and PostCSS errors out.
+ * Loading Satoshi via <link> sidesteps PostCSS entirely.
+ */
+
+/*
+ * HR Bot — Design Tokens
+ *
+ * Aligned to ruh.ai's actual brand: vivid magenta + violet on a clean
+ * white surface. Extracted directly from ruh.ai's CSS bundle (change 028).
+ * Tokens drive every utility class via Tailwind 4 `@theme inline`, so
+ * any future palette retune is a one-file change.
+ */
+
+@theme inline {
+  /* surfaces */
+  --color-bg:               #ffffff;
+  --color-surface:          #ffffff;
+  --color-surface-muted:    #f8f8f8;
+  --color-border:           #e7e5e4;
+  --color-border-strong:    #d6d3d1;
+
+  /* text — high-contrast near-black ramp matching ruh.ai */
+  --color-ink:              #121212;
+  --color-ink-muted:        #3e3e3e;
+  --color-ink-subtle:       #6b7280;
+  --color-ink-faint:        #b1b1b7;
+
+  /* dark surfaces (footer, deep CTAs) */
+  --color-dark:             #1a192b;
+  --color-dark-soft:        #2b2b2b;
+
+  /* brand — ruh.ai magenta + violet */
+  --color-brand:            #AE00D0;
+  --color-brand-hover:      #9000AE;
+  --color-brand-soft:       #fdf0ff;
+  --color-brand-ring:       #f5d4ff;
+
+  --color-accent:           #7B5AFF;
+  --color-accent-hover:     #6745E8;
+  --color-accent-soft:      #f0ebff;
+  --color-accent-ring:      #dcd1ff;
+
+  /* tier semantics — bonus tiers from scoring.py */
+  --color-tier-full:        #059669;  /* emerald-600 — Full bonus  */
+  --color-tier-partial:     #d97706;  /* amber-600   — Partial      */
+  --color-tier-coach:       #2563eb;  /* blue-600    — Manager 1:1  */
+  --color-tier-growth:      #e11d48;  /* rose-600    — Growth plan  */
+
+  /* fonts — Satoshi for UI, Geist Mono for tabular figures */
+  --font-sans: "Satoshi", var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.005em;
+}
+
+/* Heading rhythm — Satoshi looks best with slight negative tracking */
+h1, h2, h3, h4 {
+  letter-spacing: -0.02em;
+}
+
+/* Subtle, refined focus ring used by buttons + interactive elements */
+:where(button, a, [role="button"], input, select, textarea):focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Recharts: cleaner axis ticks on light backgrounds */
+.recharts-cartesian-axis-tick text { fill: var(--color-ink-subtle); }
+
+/* Brand-mark stays crisp at small sizes */
+.brand-mark { display: inline-block; }
+.brand-mark img { display: block; height: 100%; width: auto; }
