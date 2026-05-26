@@ -3,11 +3,17 @@ import { notFound } from "next/navigation";
 import {
   getEmployeeTrend,
   getEmployeeRollup,
+  getIssuesForEmployeeByCycle,
   currentPeriod,
   periodLabel,
 } from "@/lib/queries";
 import { EmployeeTrendChart, type EmployeeSnapshotPoint } from "@/components/EmployeeTrendChart";
 import { EmployeeRollupView } from "@/components/EmployeeRollupView";
+import { BackButton } from "@/components/BackButton";
+import {
+  computeWeight, computeExpectedDays, classifyLane, isCompleted,
+  hasSpEstimate, computeEmployeeScore,
+} from "@/lib/issueScoring";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -80,9 +86,7 @@ export default async function EmployeePage({ params, searchParams }: Props) {
 
   return (
     <main className="max-w-7xl mx-auto px-8 py-10">
-      <Link href="/employees" className="text-sm text-slate-500 hover:text-[#AE00D0]">
-        ← All employees
-      </Link>
+      <BackButton fallbackHref="/employees" fallbackLabel="All employees" />
 
       <div className="mt-4 mb-6">
         <h1 className="text-3xl font-semibold tracking-tight text-slate-900">{name}</h1>
@@ -171,12 +175,15 @@ async function RollupTab({ name, scope, period }: {
   );
 }
 
-function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
+async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
   name: string;
   fullTrend: Awaited<ReturnType<typeof getEmployeeTrend>>;
   cycleFilter: string | null;
   daysShown: number;
 }) {
+  // Per-issue cycle-wise history (new — used by the "Issues by cycle"
+  // section below).  Returns [] for legacy data that pre-dates v3.
+  const issuesByCycle = await getIssuesForEmployeeByCycle(name);
   // Optional cycle filter
   const trend = cycleFilter
     ? fullTrend.filter((r) => r.cycle_name === cycleFilter)
@@ -243,6 +250,184 @@ function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
           <EmployeeTrendChart data={points} />
         </div>
       </section>
+
+      {/* ─── Issues by cycle — what landed on this person's plate ─── */}
+      {issuesByCycle.length > 0 && (
+        <section>
+          <div className="flex items-end justify-between mb-3 flex-wrap gap-2">
+            <div>
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-500">
+                Issues by cycle
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Every ticket assigned to {name} across {issuesByCycle.length} cycle{issuesByCycle.length !== 1 ? "s" : ""}.
+                Latest cycle is shown expanded.
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            {issuesByCycle
+              .filter(c => !cycleFilter || c.cycle_name === cycleFilter)
+              .map((c, idx) => {
+                // Compute per-cycle aggregate score for this employee
+                const score = computeEmployeeScore(c.issues,
+                  c.cycle_end ? c.cycle_end + "T23:59:59Z" : "2099-12-31T23:59:59Z");
+                const pctStr = score.pctComplete !== null
+                  ? `${Math.round(score.pctComplete * 100)}%`
+                  : "—";
+                const done = c.issues.filter(i => isCompleted(i)).length;
+                return (
+                  <details key={c.cycle_id}
+                           open={idx === 0}
+                           className="group bg-white rounded-xl border border-stone-200 overflow-hidden hover:border-stone-300 transition-colors">
+                    <summary className="cursor-pointer list-none px-4 py-3 hover:bg-stone-50/60 select-none">
+                      <div className="flex items-center justify-between gap-4 flex-wrap">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <span className="text-slate-400 group-open:rotate-90 transition-transform inline-block w-3 flex-none">▸</span>
+                          <div className="min-w-0">
+                            <div className="font-medium text-slate-900 truncate flex items-center gap-2">
+                              {c.cycle_name}
+                              {c.team && (
+                                <span className="text-[11px] font-normal text-slate-500">· {c.team}</span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-slate-500 tabular-nums">
+                              {c.cycle_start && c.cycle_end ? (
+                                <>
+                                  {new Date(c.cycle_start + "T00:00:00Z").toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                                  {" → "}
+                                  {new Date(c.cycle_end + "T00:00:00Z").toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}
+                                </>
+                              ) : "(no cycle dates)"}
+                              {" · "}
+                              {c.issues.length} issue{c.issues.length !== 1 ? "s" : ""}
+                              {" · "}
+                              {done} done
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3 text-sm">
+                          <span className="text-slate-500 tabular-nums hidden sm:inline">
+                            weight {score.weightDone}/{score.weightTotal}
+                          </span>
+                          <div className="w-20">
+                            <div className="h-1.5 rounded-full bg-stone-100 overflow-hidden">
+                              <div className={
+                                score.classification === "high"  ? "h-full bg-emerald-500"
+                                : score.classification === "mid" ? "h-full bg-amber-500"
+                                : "h-full bg-rose-400"
+                              } style={{ width: `${Math.round((score.pctComplete ?? 0) * 100)}%` }} />
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-0.5 text-right tabular-nums">{pctStr}</div>
+                          </div>
+                          {classBadge(score.classification === "no_data" ? null : score.classification)}
+                        </div>
+                      </div>
+                    </summary>
+
+                    <div className="border-t border-stone-100 overflow-x-auto">
+                      <table className="w-full min-w-[920px] text-sm">
+                        <thead className="bg-stone-50/60 text-[11px] uppercase tracking-wider text-slate-500">
+                          <tr>
+                            <th className="text-left  px-3 py-2 whitespace-nowrap">Issue&nbsp;ID</th>
+                            <th className="text-left  px-3 py-2">Title</th>
+                            <th className="text-left  px-3 py-2 whitespace-nowrap">Priority</th>
+                            <th className="text-right px-3 py-2 whitespace-nowrap">Story&nbsp;Pts</th>
+                            <th className="text-right px-3 py-2 whitespace-nowrap">Weighted</th>
+                            <th className="text-right px-3 py-2 whitespace-nowrap">Target&nbsp;Days</th>
+                            <th className="text-left  px-3 py-2 whitespace-nowrap">Schedule&nbsp;Fit</th>
+                            <th className="text-left  px-3 py-2 whitespace-nowrap">Status</th>
+                            <th className="text-left  px-3 py-2 whitespace-nowrap">Assigned</th>
+                            <th className="text-left  px-3 py-2 whitespace-nowrap">Done&nbsp;on</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {c.issues.map((it) => {
+                            const cyEnd = c.cycle_end ? c.cycle_end + "T23:59:59Z" : "2099-12-31";
+                            const lane = classifyLane(it, cyEnd);
+                            const w = computeWeight(it);
+                            const ed = computeExpectedDays(it);
+                            const isDone = isCompleted(it);
+                            const hasEst = hasSpEstimate(it);
+                            const priCls = it.priority === "p0" ? "bg-rose-100 text-rose-800"
+                                         : it.priority === "p1" ? "bg-amber-100 text-amber-800"
+                                         : it.priority === "p2" ? "bg-stone-100 text-slate-700"
+                                         : "bg-slate-50 text-slate-500";
+                            const laneCls = lane === "normal"    ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                                          : lane === "tight"     ? "bg-amber-50 text-amber-700 ring-amber-200"
+                                          : lane === "late_dump" ? "bg-rose-50 text-rose-700 ring-rose-200"
+                                          : "bg-stone-100 text-slate-500 ring-slate-200";
+                            const laneLabel = lane === "normal" ? "normal"
+                                            : lane === "tight" ? "tight-fair"
+                                            : lane === "late_dump" ? "late dump"
+                                            : lane === "removed" ? "removed" : "blocked";
+                            const statusCls = isDone ? "bg-emerald-100 text-emerald-800"
+                                            : it.status === "in_progress" || it.status === "started" ? "bg-blue-50 text-blue-700"
+                                            : "bg-slate-100 text-slate-600";
+                            return (
+                              <tr key={it.issue_id}
+                                  className={`border-t border-stone-100 ${isDone ? "bg-emerald-50/20" : ""}`}>
+                                <td className="px-3 py-2 font-mono text-xs text-slate-600">{it.issue_id}</td>
+                                <td className="px-3 py-2 text-slate-800 max-w-md truncate" title={it.title ?? ""}>
+                                  {it.title ?? <span className="text-slate-300">—</span>}
+                                </td>
+                                <td className="px-3 py-2">
+                                  {it.priority
+                                    ? <span className={`inline-block text-[10px] ${priCls} rounded px-1.5 py-0.5 font-mono`}>{it.priority}</span>
+                                    : <span className="text-slate-300">—</span>}
+                                </td>
+                                <td className="px-3 py-2 text-right tabular-nums">
+                                  {hasEst
+                                    ? <span className="text-slate-700 font-medium">{it.story_points}</span>
+                                    : <span title="PM has not added an SP estimate yet — weight from 1-SP minimum"
+                                            className="inline-block text-[10px] bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-2 py-0.5">no&nbsp;estimate</span>}
+                                </td>
+                                <td className="px-3 py-2 text-right tabular-nums">
+                                  <span className={`font-medium ${hasEst ? "text-slate-900" : "text-slate-400"}`}>{w}</span>
+                                </td>
+                                <td className="px-3 py-2 text-right tabular-nums text-slate-700 font-medium">
+                                  {ed}<span className="text-[10px] text-slate-400 ml-0.5">d</span>
+                                </td>
+                                <td className="px-3 py-2">
+                                  <span className={`inline-block text-[10px] ${laneCls} ring-1 ring-inset rounded-full px-1.5 py-0.5`}>
+                                    {laneLabel}
+                                  </span>
+                                </td>
+                                <td className="px-3 py-2">
+                                  {it.status
+                                    ? <span className={`inline-block text-[10px] ${statusCls} rounded px-1.5 py-0.5`}>
+                                        {it.status === "in_progress" ? "in progress" : it.status}
+                                      </span>
+                                    : <span className="text-slate-300">—</span>}
+                                </td>
+                                <td className="px-3 py-2 text-xs text-slate-500">
+                                  {it.assigned_at ? new Date(it.assigned_at).toLocaleDateString(undefined, { day: "numeric", month: "short" }) : "—"}
+                                </td>
+                                <td className="px-3 py-2 text-xs text-slate-500">
+                                  {it.completed_at
+                                    ? <span className="text-emerald-700">{new Date(it.completed_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+                                    : <span className="text-slate-300">—</span>}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          {c.issues.length === 0 && (
+                            <tr>
+                              <td colSpan={10} className="px-4 py-6 text-center text-slate-400 text-xs">
+                                No issues recorded for this cycle.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                );
+              })}
+          </div>
+        </section>
+      )}
 
       <section>
         <div className="flex items-end justify-between mb-3">

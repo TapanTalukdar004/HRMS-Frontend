@@ -214,6 +214,8 @@ export type SnapshotRow = {
   cycle_id: string;
   received_at: string;
   snapshot_at: string;             // Esha's date, falls back to received_at
+  cycle_start: string | null;      // for cycle-position computation
+  cycle_end: string | null;        // for v3 lane classification + position
   n_employees: number;
   n_high: number;
   n_mid: number;
@@ -227,12 +229,181 @@ export async function listSnapshotsForCycle(team: string, cycleName: string): Pr
       id AS cycle_id,
       received_at::text,
       COALESCE(snapshot_at, received_at)::text AS snapshot_at,
+      cycle_start::text,
+      cycle_end::text,
       n_employees, n_high, n_mid, n_low,
       NULLIF(parsed_payload::jsonb ->> 'days_left', '')::int AS days_left
     FROM performance_cycles
     WHERE team = $1 AND cycle_name = $2
     ORDER BY COALESCE(snapshot_at, received_at) ASC
   `, [team, cycleName]);
+}
+
+// ─── v3 per-issue queries (migration 019) ────────────────────────────────
+
+/** One row from cycle_employee_issues, ready to feed into issueScoring.ts.
+ *  Names mirror the Python ORM (CycleEmployeeIssue) and Esha v3 payload.
+ */
+export type CycleIssue = {
+  id: string;
+  cycle_id: string;
+  employee_name: string;
+  employee_id: string | null;
+  issue_id: string;
+  title: string | null;
+  issue_type: string | null;
+  priority: string | null;
+  story_points: number | null;
+  status: string | null;
+  labels: string[] | null;
+  assigned_at: string | null;
+  completed_at: string | null;
+  snapshot_at: string;
+};
+
+/** Per-employee completeness flag for one snapshot.
+ *  'complete'  → full data received
+ *  'truncated' → Esha's JSON was cut off mid-employee; we recovered
+ *                whatever survived but should NOT trust the summary
+ *  'missing'   → employee was in earlier snapshots but absent today
+ */
+export type SnapshotCompleteness = {
+  cycle_id: string;
+  employee_name: string;
+  snapshot_at: string;
+  status: "complete" | "truncated" | "missing";
+  n_issues_received: number;
+  n_issues_expected: number | null;
+  parser_warning: string | null;
+};
+
+/** One employee's full issue history grouped by cycle.
+ *  Returns: {cycle_name: {cycle_id, team, cycle_start, cycle_end, snapshot_at, issues[]}}
+ *  Used by the employee profile page to show what they had on their
+ *  plate across each cycle (cycle-wise breakdown).
+ */
+export type EmployeeCycleBucket = {
+  cycle_id: string;
+  cycle_name: string;
+  team: string | null;
+  cycle_start: string | null;
+  cycle_end: string | null;
+  snapshot_at: string;
+  issues: CycleIssue[];
+};
+
+export async function getIssuesForEmployeeByCycle(
+  employeeName: string,
+): Promise<EmployeeCycleBucket[]> {
+  // First: discover which cycles this person appears in.
+  const cycles = await q<{ cycle_id: string; cycle_name: string; team: string | null;
+                          cycle_start: string | null; cycle_end: string | null;
+                          snapshot_at: string }>(
+    `
+    SELECT DISTINCT
+      pc.id          AS cycle_id,
+      pc.cycle_name,
+      pc.team,
+      pc.cycle_start::text,
+      pc.cycle_end::text,
+      COALESCE(pc.snapshot_at, pc.received_at)::text AS snapshot_at
+    FROM cycle_employee_issues cei
+    JOIN performance_cycles pc ON pc.id = cei.cycle_id
+    WHERE cei.employee_name = $1
+    ORDER BY snapshot_at DESC
+    `,
+    [employeeName],
+  );
+  if (cycles.length === 0) return [];
+
+  // Then: fetch the latest snapshot of every issue this person has, across all cycles.
+  const issues = await q<CycleIssue>(
+    `
+    WITH latest AS (
+      SELECT DISTINCT ON (cycle_id, issue_id)
+        id, cycle_id, employee_name, employee_id, issue_id, title,
+        issue_type, priority, story_points, status, labels,
+        assigned_at, completed_at, snapshot_at
+      FROM cycle_employee_issues
+      WHERE employee_name = $1
+      ORDER BY cycle_id, issue_id, snapshot_at DESC
+    )
+    SELECT * FROM latest
+    ORDER BY cycle_id, priority NULLS LAST, issue_id
+    `,
+    [employeeName],
+  );
+
+  const byId: Record<string, CycleIssue[]> = {};
+  for (const it of issues) {
+    (byId[it.cycle_id] ??= []).push(it);
+  }
+  return cycles.map(c => ({
+    cycle_id: c.cycle_id,
+    cycle_name: c.cycle_name,
+    team: c.team,
+    cycle_start: c.cycle_start,
+    cycle_end: c.cycle_end,
+    snapshot_at: c.snapshot_at,
+    issues: byId[c.cycle_id] ?? [],
+  }));
+}
+
+/** All issues in a cycle, grouped by employee.
+ *  Use this in the cycle page to render per-issue tables.
+ *  Only returns rows from the LATEST snapshot for each issue
+ *  (issues persist across snapshots; we want the current state).
+ */
+export async function getCycleIssuesByEmployee(
+  cycleId: string,
+): Promise<Record<string, CycleIssue[]>> {
+  const rows = await q<CycleIssue>(
+    `
+    WITH latest AS (
+      SELECT DISTINCT ON (cycle_id, employee_name, issue_id)
+        id, cycle_id, employee_name, employee_id, issue_id, title,
+        issue_type, priority, story_points, status, labels,
+        assigned_at, completed_at, snapshot_at
+      FROM cycle_employee_issues
+      WHERE cycle_id = $1
+      ORDER BY cycle_id, employee_name, issue_id, snapshot_at DESC
+    )
+    SELECT * FROM latest
+    ORDER BY employee_name, priority NULLS LAST, issue_id
+    `,
+    [cycleId],
+  );
+  const byEmp: Record<string, CycleIssue[]> = {};
+  for (const r of rows) {
+    if (!byEmp[r.employee_name]) byEmp[r.employee_name] = [];
+    byEmp[r.employee_name].push(r);
+  }
+  return byEmp;
+}
+
+/** Per-employee completeness for the LATEST snapshot of a cycle.
+ *  Returns one row per employee.  Use this to show ⚠️ truncation badges
+ *  on the cycle page.
+ */
+export async function getCycleCompleteness(
+  cycleId: string,
+): Promise<Record<string, SnapshotCompleteness>> {
+  const rows = await q<SnapshotCompleteness>(
+    `
+    SELECT DISTINCT ON (cycle_id, employee_name)
+      cycle_id, employee_name, snapshot_at, status,
+      n_issues_received, n_issues_expected, parser_warning
+    FROM cycle_snapshot_completeness
+    WHERE cycle_id = $1
+    ORDER BY cycle_id, employee_name, snapshot_at DESC
+    `,
+    [cycleId],
+  );
+  const byEmp: Record<string, SnapshotCompleteness> = {};
+  for (const r of rows) {
+    byEmp[r.employee_name] = r;
+  }
+  return byEmp;
 }
 
 /** Snapshot detail — employee rows as of one specific performance_cycles row. */
