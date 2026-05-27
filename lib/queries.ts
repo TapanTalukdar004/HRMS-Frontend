@@ -349,6 +349,273 @@ export async function getIssuesForEmployeeByCycle(
   }));
 }
 
+/** Cross-snapshot, REASSIGNMENT-AWARE view of a cycle's issues.
+ *
+ *  Two problems this solves at once:
+ *
+ *  (A) Esha drops people once they have no active work — an engineer
+ *      who finished early (e.g. nikhil) disappears from later snapshots.
+ *      We want them visible all cycle long with their last-known state.
+ *
+ *  (B) Issues can be REASSIGNED from one engineer to another mid-cycle.
+ *      Esha sends the same issue under a new employee_name; the
+ *      `assigned_at` Esha sends is the issue's ORIGINAL creation date,
+ *      not when the new assignee actually got it.  Naively keeping
+ *      rows under both employees would double-count the work.
+ *
+ *  How we handle it:
+ *    1. Each issue gets ONE current assignee — whoever has the most
+ *       recent snapshot row.
+ *    2. We compute `effective_assigned_at` = the snapshot_at when the
+ *       CURRENT assignee FIRST appeared as holder of this issue.
+ *       That's the date used for Schedule-fit lane classification.
+ *    3. If a previous assignee existed, we record `reassigned_from`
+ *       (their name) and `reassigned_at` (= effective_assigned_at).
+ *    4. We separately track `reassignedAwayCount` per employee — how
+ *       many issues they were the FIRST holder of but no longer have.
+ *       This is a soft HR signal, never affects score.
+ */
+export type CycleIssueWithReassignment = CycleIssue & {
+  effective_assigned_at: string;        // when current assignee got it
+  reassigned_from: string | null;       // previous holder, if any
+  reassigned_at: string | null;         // when reassignment happened
+};
+
+export type CycleCrossSnapshotResult = {
+  /** Issues grouped by their CURRENT assignee.  Each issue appears
+   *  exactly once (under whoever holds it now). */
+  issuesByEmployee: Record<string, CycleIssueWithReassignment[]>;
+  /** snapshot_at (ISO) of each employee's most-recent appearance. */
+  lastSeenByEmployee: Record<string, string>;
+  /** Names that appear in the CURRENT (selected) snapshot.  Used to
+   *  visually distinguish "fresh data today" vs "carried over". */
+  currentEmployeeNames: string[];
+  /** Soft HR signal: per-employee count of issues that USED to be
+   *  theirs but are now assigned elsewhere.  Never affects score. */
+  reassignedAwayCount: Record<string, number>;
+};
+
+export async function getCycleIssuesAcrossSnapshots(
+  team: string,
+  cycleName: string,
+  currentCycleId: string,
+): Promise<CycleCrossSnapshotResult> {
+  // Pull every (issue, assignee) seen in this cycle, plus the FIRST
+  // and LAST snapshot_at that assignee held it.  Done in one query.
+  const rows = await q<{
+    issue_id: string;
+    employee_name: string;
+    employee_id: string | null;
+    title: string | null;
+    issue_type: string | null;
+    priority: string | null;
+    story_points: number | null;
+    status: string | null;
+    labels: string[] | null;
+    esha_assigned_at: string | null;
+    completed_at: string | null;
+    latest_snapshot_at: string;
+    first_seen_at: string;            // when THIS assignee first held this issue
+    cycle_id: string;
+    assignee_rank: number;            // 1 = current, 2 = previous, 3 = older
+  }>(
+    `
+    WITH cycle_snapshots AS (
+      SELECT id, COALESCE(snapshot_at, received_at) AS snap
+      FROM performance_cycles
+      WHERE team = $1 AND cycle_name = $2
+    ),
+    all_rows AS (
+      SELECT cei.*
+      FROM cycle_employee_issues cei
+      JOIN cycle_snapshots cs ON cs.id = cei.cycle_id
+    ),
+    -- Latest row per (issue, assignee): the most recent state of this
+    -- issue while this person was holding it.  DISTINCT ON keeps the
+    -- whole row, including TEXT[] labels (which ARRAY_AGG cannot).
+    per_assignee_latest AS (
+      SELECT DISTINCT ON (issue_id, employee_name)
+        issue_id, employee_name, employee_id, title, issue_type,
+        priority, story_points, status, labels, assigned_at,
+        completed_at, snapshot_at, cycle_id
+      FROM all_rows
+      ORDER BY issue_id, employee_name, snapshot_at DESC
+    ),
+    -- First snapshot_at where this person held this issue.
+    per_assignee_first AS (
+      SELECT issue_id, employee_name, MIN(snapshot_at) AS first_seen_at
+      FROM all_rows
+      GROUP BY issue_id, employee_name
+    ),
+    -- Rank assignees within an issue by recency of LAST appearance.
+    -- Rank 1 = current holder, 2 = previous, etc.
+    ranked AS (
+      SELECT
+        l.issue_id, l.employee_name, l.employee_id::text AS employee_id,
+        l.title, l.issue_type, l.priority, l.story_points,
+        l.status, l.labels,
+        l.assigned_at::text AS esha_assigned_at,
+        l.completed_at::text AS completed_at,
+        l.snapshot_at::text  AS latest_snapshot_at,
+        f.first_seen_at::text,
+        l.cycle_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY l.issue_id ORDER BY l.snapshot_at DESC
+        )::int AS assignee_rank
+      FROM per_assignee_latest l
+      JOIN per_assignee_first f
+        ON f.issue_id = l.issue_id AND f.employee_name = l.employee_name
+    )
+    SELECT * FROM ranked
+    ORDER BY issue_id, assignee_rank
+    `,
+    [team, cycleName],
+  );
+
+  // Build maps: current assignee per issue, previous assignee per issue.
+  const currentByIssue: Record<string, typeof rows[number]> = {};
+  const previousByIssue: Record<string, typeof rows[number]> = {};
+  const firstHolderByIssue: Record<string, string> = {};
+  for (const r of rows) {
+    if (r.assignee_rank === 1) currentByIssue[r.issue_id] = r;
+    if (r.assignee_rank === 2) previousByIssue[r.issue_id] = r;
+    // Track first-ever holder so we can count reassigned-away per person
+    const prev = firstHolderByIssue[r.issue_id];
+    if (!prev) firstHolderByIssue[r.issue_id] = r.employee_name;
+    // We rely on ROW_NUMBER ordering DESC, so the LAST entry per issue
+    // is the FIRST holder.  Overwrite blindly — the loop ends on the
+    // oldest assignee.
+    firstHolderByIssue[r.issue_id] = r.employee_name;
+  }
+
+  // Compose the public result.
+  const issuesByEmployee: Record<string, CycleIssueWithReassignment[]> = {};
+  const lastSeenByEmployee: Record<string, string> = {};
+  for (const issueId of Object.keys(currentByIssue)) {
+    const cur = currentByIssue[issueId];
+    const prev = previousByIssue[issueId];
+    // Effective assigned date for the CURRENT holder:
+    //   • No reassignment → use Esha's assigned_at (issue's original).
+    //   • Reassignment    → use first_seen_at (when this person got it).
+    const effectiveAssigned = prev
+      ? cur.first_seen_at
+      : (cur.esha_assigned_at ?? cur.first_seen_at);
+    const item: CycleIssueWithReassignment = {
+      id: "",  // not surfaced
+      cycle_id: cur.cycle_id,
+      employee_name: cur.employee_name,
+      employee_id: cur.employee_id,
+      issue_id: cur.issue_id,
+      title: cur.title,
+      issue_type: cur.issue_type,
+      priority: cur.priority,
+      story_points: cur.story_points,
+      status: cur.status,
+      labels: cur.labels,
+      assigned_at: cur.esha_assigned_at,
+      completed_at: cur.completed_at,
+      snapshot_at: cur.latest_snapshot_at,
+      effective_assigned_at: effectiveAssigned,
+      reassigned_from: prev ? prev.employee_name : null,
+      reassigned_at:   prev ? cur.first_seen_at  : null,
+    };
+    (issuesByEmployee[cur.employee_name] ??= []).push(item);
+    const prevSeen = lastSeenByEmployee[cur.employee_name];
+    if (!prevSeen || cur.latest_snapshot_at > prevSeen) {
+      lastSeenByEmployee[cur.employee_name] = cur.latest_snapshot_at;
+    }
+  }
+
+  // Reassigned-away count per employee (soft HR signal).
+  // An employee was a "first holder" of an issue but no longer is.
+  const reassignedAwayCount: Record<string, number> = {};
+  for (const issueId of Object.keys(firstHolderByIssue)) {
+    const firstHolder = firstHolderByIssue[issueId];
+    const currentHolder = currentByIssue[issueId]?.employee_name;
+    if (currentHolder && firstHolder !== currentHolder) {
+      reassignedAwayCount[firstHolder] = (reassignedAwayCount[firstHolder] ?? 0) + 1;
+    }
+  }
+
+  // Who's in the CURRENT snapshot's payload (not carried over)?
+  const currentRows = await q<{ employee_name: string }>(
+    `SELECT DISTINCT employee_name FROM cycle_employee_issues WHERE cycle_id = $1`,
+    [currentCycleId],
+  );
+  const currentEmployeeNames = currentRows.map(r => r.employee_name);
+
+  return { issuesByEmployee, lastSeenByEmployee, currentEmployeeNames, reassignedAwayCount };
+}
+
+
+/** For each issue in this cycle, return the state it had in the
+ *  immediately-prior snapshot (one row per issue that has a prior).
+ *  Used to render "what changed since yesterday" indicators on the
+ *  cycle page — priority bumps, SP changes, status flips, reassigns.
+ *
+ *  Returns ONLY issues whose properties differ from the most recent
+ *  prior snapshot.  If an issue was unchanged, it's omitted (the UI
+ *  has nothing to flag).
+ */
+export type PreviousIssueState = {
+  issue_id: string;
+  prev_priority: string | null;
+  prev_story_points: number | null;
+  prev_status: string | null;
+  prev_employee_name: string;
+  prev_snapshot_at: string;
+};
+
+export async function getCyclePreviousSnapshotChanges(
+  team: string,
+  cycleName: string,
+): Promise<Record<string, PreviousIssueState>> {
+  const rows = await q<PreviousIssueState>(
+    `
+    WITH cycle_snapshots AS (
+      SELECT id, COALESCE(snapshot_at, received_at) AS snap
+      FROM performance_cycles
+      WHERE team = $1 AND cycle_name = $2
+    ),
+    history AS (
+      SELECT
+        cei.issue_id,
+        cei.employee_name,
+        cei.priority,
+        cei.story_points,
+        cei.status,
+        cei.snapshot_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY cei.issue_id ORDER BY cei.snapshot_at DESC
+        ) AS rn
+      FROM cycle_employee_issues cei
+      JOIN cycle_snapshots cs ON cs.id = cei.cycle_id
+    ),
+    cur AS (SELECT * FROM history WHERE rn = 1),
+    prv AS (SELECT * FROM history WHERE rn = 2)
+    SELECT
+      cur.issue_id,
+      prv.priority           AS prev_priority,
+      prv.story_points       AS prev_story_points,
+      prv.status             AS prev_status,
+      prv.employee_name      AS prev_employee_name,
+      prv.snapshot_at::text  AS prev_snapshot_at
+    FROM cur
+    JOIN prv ON prv.issue_id = cur.issue_id
+    WHERE
+         COALESCE(cur.priority, '')                 IS DISTINCT FROM COALESCE(prv.priority, '')
+      OR COALESCE(cur.story_points::text, '')       IS DISTINCT FROM COALESCE(prv.story_points::text, '')
+      OR COALESCE(cur.status, '')                   IS DISTINCT FROM COALESCE(prv.status, '')
+      OR cur.employee_name                          IS DISTINCT FROM prv.employee_name
+    `,
+    [team, cycleName],
+  );
+  const byId: Record<string, PreviousIssueState> = {};
+  for (const r of rows) byId[r.issue_id] = r;
+  return byId;
+}
+
+
 /** All issues in a cycle, grouped by employee.
  *  Use this in the cycle page to render per-issue tables.
  *  Only returns rows from the LATEST snapshot for each issue

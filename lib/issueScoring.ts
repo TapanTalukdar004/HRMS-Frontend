@@ -207,17 +207,31 @@ export function computeEmployeeScore(
     lanes[lane] = (lanes[lane] ?? 0) + 1;
     const w = computeWeight(issue);
     const iid = issue.issue_id || "?";
+    const done = isCompleted(issue);
 
-    if (lane === "late_dump" || lane === "removed") {
-      const note = lane === "late_dump"
-        ? "late dump — excluded"
-        : "removed (wontfix/duplicate/cancelled)";
-      explanation.push(`${iid}  ${note} (weight ${w})`);
+    // Disposition labels — always excluded.
+    if (lane === "removed") {
+      explanation.push(`${iid}  removed (wontfix/duplicate/cancelled) — excluded (weight ${w})`);
       continue;
     }
 
+    // Late-dump asymmetric rule (mirrors scoring.py):
+    //   • completed   → fully credited (heroic delivery counts!)
+    //   • incomplete  → excluded entirely (no penalty for unfair scope)
+    if (lane === "late_dump") {
+      if (done) {
+        weightTotal += w;
+        weightDone += w;
+        explanation.push(`${iid}  late dump COMPLETED → counted in full (weight ${w})`);
+      } else {
+        explanation.push(`${iid}  late dump not done → excluded, no penalty (weight ${w})`);
+      }
+      continue;
+    }
+
+    // Normal + tight-fair: always in denominator.
     weightTotal += w;
-    if (isCompleted(issue)) {
+    if (done) {
       const effectiveW = lane === "tight" ? w * TIGHT_BONUS : w;
       weightDone += effectiveW;
       if (lane === "tight") {

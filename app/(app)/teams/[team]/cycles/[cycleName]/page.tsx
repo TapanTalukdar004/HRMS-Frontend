@@ -4,6 +4,8 @@ import {
   listSnapshotsForCycle,
   getSnapshotEmployeesWithDelta,
   getCycleIssuesByEmployee,
+  getCycleIssuesAcrossSnapshots,
+  getCyclePreviousSnapshotChanges,
   getCycleCompleteness,
   listTeams,
 } from "@/lib/queries";
@@ -90,6 +92,31 @@ function StatTile({ label, value, sub, accent }: {
       <div className="text-[10px] uppercase tracking-wider text-slate-400 mb-1">{label}</div>
       <div className={`text-xl font-bold tabular-nums leading-tight ${accentValue}`}>{value}</div>
       {sub && <div className="text-[11px] text-slate-500 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+function DiffPill({ icon, label, count, accent }: {
+  icon: string;
+  label: string;
+  count: number;
+  accent: "emerald" | "amber" | "violet" | "blue" | "rose";
+}) {
+  const isZero = count === 0;
+  const accentBg = isZero
+    ? "bg-stone-50 border-stone-200 text-slate-400"
+    : accent === "emerald" ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+    : accent === "amber"   ? "bg-amber-50 border-amber-200 text-amber-800"
+    : accent === "violet"  ? "bg-violet-50 border-violet-200 text-violet-800"
+    : accent === "blue"    ? "bg-blue-50 border-blue-200 text-blue-800"
+    :                        "bg-rose-50 border-rose-200 text-rose-800";
+  return (
+    <div className={`border rounded-xl px-3 py-2 ${accentBg}`}>
+      <div className="flex items-center gap-1.5">
+        <span className="text-base leading-none" aria-hidden>{icon}</span>
+        <span className="text-2xl font-bold tabular-nums leading-none">{count}</span>
+      </div>
+      <div className={`text-[10px] uppercase tracking-wider mt-1 ${isZero ? "text-slate-400" : "opacity-80"}`}>{label}</div>
     </div>
   );
 }
@@ -233,12 +260,19 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   const employees = await getSnapshotEmployeesWithDelta(selected.cycle_id);
 
   // ── v3 per-issue data ────────────────────────────────────────────────
-  // Fetched in parallel.  Returns empty objects on cycles that pre-date
-  // migration 019, so the section just doesn't render — safe fall-through.
-  const [issuesByEmployee, completenessByEmployee] = await Promise.all([
-    getCycleIssuesByEmployee(selected.cycle_id),
+  // Now uses the cross-snapshot query so employees who appeared earlier
+  // in the cycle (and got dropped by Esha because they finished early
+  // or briefly had no active work) stay visible with their last-known
+  // state.  See getCycleIssuesAcrossSnapshots for the rationale.
+  const [crossSnap, completenessByEmployee, prevChangesByIssue] = await Promise.all([
+    getCycleIssuesAcrossSnapshots(team, cycleName, selected.cycle_id),
     getCycleCompleteness(selected.cycle_id),
+    getCyclePreviousSnapshotChanges(team, cycleName),
   ]);
+  const issuesByEmployee = crossSnap.issuesByEmployee;
+  const lastSeenByEmployee = crossSnap.lastSeenByEmployee;
+  const currentEmployeeSet = new Set(crossSnap.currentEmployeeNames);
+  const reassignedAwayCount = crossSnap.reassignedAwayCount;
   const hasV3Data = Object.keys(issuesByEmployee).length > 0
                   || Object.keys(completenessByEmployee).length > 0;
   // Use cycle_end for lane classification; fall back to a far-future
@@ -604,6 +638,55 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
         </p>
       </section>
 
+      {/* ─── What changed since previous snapshot ─────────────────────── */}
+      {hasV3Data && Object.keys(prevChangesByIssue).length > 0 && (() => {
+        const changes = Object.values(prevChangesByIssue);
+        // Bucket by type of change
+        const prevSnapshotAt = changes[0]?.prev_snapshot_at;
+        const allIssuesFlat = Object.values(issuesByEmployee).flat();
+        const issueById = new Map(allIssuesFlat.map(i => [i.issue_id, i]));
+        let nPriority = 0, nSp = 0, nStatusDone = 0, nStatusOther = 0, nReassigned = 0;
+        for (const c of changes) {
+          const cur = issueById.get(c.issue_id);
+          if (!cur) continue;
+          if (cur.priority !== c.prev_priority)             nPriority++;
+          if (cur.story_points !== c.prev_story_points)     nSp++;
+          if (cur.status !== c.prev_status) {
+            if (cur.status === "done")                       nStatusDone++;
+            else                                             nStatusOther++;
+          }
+          if (cur.employee_name !== c.prev_employee_name)   nReassigned++;
+        }
+        return (
+          <section className="mt-10">
+            <div className="bg-gradient-to-br from-violet-50/40 via-white to-amber-50/30 border border-violet-100 rounded-2xl p-5">
+              <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-600">
+                  What changed since previous snapshot
+                </h2>
+                {prevSnapshotAt && (
+                  <span className="text-xs text-slate-500">
+                    diff vs <b className="text-slate-700">{new Date(prevSnapshotAt).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}</b>
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                <DiffPill icon="✓" label="Completed" count={nStatusDone}    accent="emerald" />
+                <DiffPill icon="↑" label="Priority bumped" count={nPriority} accent="amber" />
+                <DiffPill icon="↑" label="SP re-pointed" count={nSp}         accent="violet" />
+                <DiffPill icon="↻" label="Status flipped" count={nStatusOther} accent="blue" />
+                <DiffPill icon="↻" label="Reassigned" count={nReassigned}    accent="rose" />
+              </div>
+              <p className="text-[11px] text-slate-500 mt-3">
+                Mid-cycle changes are normal — but a flurry of priority bumps or status reversals close to cycle end is worth a PM conversation.
+                Each affected issue row shows a small <span className="text-violet-600 font-medium">↑ from X</span> indicator
+                so you can see exactly what shifted.
+              </p>
+            </div>
+          </section>
+        );
+      })()}
+
       {/* ─── v3 per-issue detail ──────────────────────────────────────── */}
       {hasV3Data && (
         <section className="mt-12">
@@ -687,9 +770,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
             )}
 
             {Object.entries(issuesByEmployee).map(([empName, issues]) => {
-              const score = computeEmployeeScore(issues, cycleEndForScoring);
+              // Use effective_assigned_at when scoring (reassignment-aware).
+              const issuesForScoring = issues.map(it => ({ ...it, assigned_at: it.effective_assigned_at }));
+              const score = computeEmployeeScore(issuesForScoring, cycleEndForScoring);
               const complete = completenessByEmployee[empName];
               const isTruncated = complete?.status === "truncated";
+              const reassignedAway = reassignedAwayCount[empName] ?? 0;
               const pctStr = score.pctComplete !== null
                 ? `${Math.round(score.pctComplete * 100)}%`
                 : "—";
@@ -722,6 +808,35 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                             {complete.n_issues_expected !== null && (<>/{complete.n_issues_expected}</>)}
                           </span>
                         )}
+                        {/* Carried-over badge: this employee wasn't in
+                            today's Esha payload but appeared in an
+                            earlier snapshot of the same cycle.  Could be:
+                            (a) finished early & dropped by Esha's filter
+                            (b) on PTO / context-switched, will reappear
+                            We show their last-known state either way. */}
+                        {/* Soft HR signal: how many issues used to be
+                            this person's but now belong to someone else.
+                            Doesn't affect score — just visibility. */}
+                        {reassignedAway > 0 && (
+                          <span title={`${reassignedAway} issue${reassignedAway === 1 ? "" : "s"} this person started but no longer has (reassigned to someone else). This DOES NOT affect their score. Soft HR signal — may indicate workload rebalancing or a fit conversation.`}
+                                className="ml-2 inline-block text-[10px] bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-200 rounded-full px-2 py-0.5 flex-none whitespace-nowrap">
+                            ↻ {reassignedAway} reassigned away
+                          </span>
+                        )}
+                        {!currentEmployeeSet.has(empName) && !isTruncated && lastSeenByEmployee[empName] && (() => {
+                          const lastSeen = lastSeenByEmployee[empName];
+                          const isAllDone = issues.length > 0 && issues.every(i => isCompleted(i));
+                          const label = isAllDone ? "completed early" : "carried over";
+                          const cls = isAllDone
+                            ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                            : "bg-violet-50 text-violet-700 ring-violet-200";
+                          return (
+                            <span title={`Not in today's snapshot. Last seen ${new Date(lastSeen).toLocaleDateString(undefined, { day: "numeric", month: "short" })}. Showing their last-known issues for this cycle.`}
+                                  className={`ml-2 inline-block text-[10px] ${cls} ring-1 ring-inset rounded-full px-2 py-0.5 flex-none whitespace-nowrap`}>
+                              {isAllDone ? "✓" : "↻"} {label} · last seen {new Date(lastSeen).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                            </span>
+                          );
+                        })()}
                       </div>
                       <div className="flex items-center gap-4">
                         {/* Lane mini-chips */}
@@ -776,19 +891,48 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                       </thead>
                       <tbody>
                         {issues.map((it) => {
-                          const lane = classifyLane(it, cycleEndForScoring);
+                          // Reassignment-aware: use effective_assigned_at
+                          // (when CURRENT assignee got it) for lane math.
+                          // For non-reassigned issues this equals
+                          // it.assigned_at, so behaviour is unchanged.
+                          const issueForScoring = { ...it, assigned_at: it.effective_assigned_at };
+                          const lane = classifyLane(issueForScoring, cycleEndForScoring);
                           const w = computeWeight(it);
                           const ed = computeExpectedDays(it);
                           const done = isCompleted(it);
                           const hasEstimate = hasSpEstimate(it);
+                          const wasReassigned = !!it.reassigned_from;
+                          // Diff vs previous snapshot — drives "was X" indicators
+                          const prev = prevChangesByIssue[it.issue_id];
+                          const priorityChanged = prev && prev.prev_priority !== it.priority;
+                          const spChanged       = prev && prev.prev_story_points !== it.story_points;
+                          const statusChanged   = prev && prev.prev_status !== it.status;
                           return (
                             <tr key={it.issue_id}
                                 className={`border-t border-stone-100 ${done ? "bg-emerald-50/20" : ""}`}>
                               <td className="px-3 py-2.5 font-mono text-xs text-slate-600">{it.issue_id}</td>
-                              <td className="px-3 py-2.5 text-slate-800 max-w-md truncate" title={it.title ?? ""}>
-                                {it.title ?? <span className="text-slate-300">—</span>}
+                              <td className="px-3 py-2.5 text-slate-800 max-w-md" title={it.title ?? ""}>
+                                <div className="truncate">{it.title ?? <span className="text-slate-300">—</span>}</div>
+                                {wasReassigned && (
+                                  <div className="mt-0.5">
+                                    <span title={`Reassigned from ${it.reassigned_from} on ${new Date(it.reassigned_at!).toLocaleDateString(undefined, { day: "numeric", month: "short" })}. Schedule fit is calculated from the date this person got it, not the issue's original creation date.`}
+                                          className="inline-block text-[10px] bg-violet-50 text-violet-700 ring-1 ring-inset ring-violet-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                                      ↻ reassigned from <b>{it.reassigned_from}</b> on {new Date(it.reassigned_at!).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                                    </span>
+                                  </div>
+                                )}
                               </td>
-                              <td className="px-3 py-2.5">{priorityBadge(it.priority)}</td>
+                              <td className="px-3 py-2.5">
+                                <div className="flex flex-col gap-0.5">
+                                  {priorityBadge(it.priority)}
+                                  {priorityChanged && (
+                                    <span title={`Priority changed since ${new Date(prev.prev_snapshot_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}`}
+                                          className="text-[9px] text-violet-600 font-medium whitespace-nowrap">
+                                      ↑ from {prev.prev_priority ?? "—"}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
                               <td className="px-3 py-2.5 text-right tabular-nums">
                                 {hasEstimate ? (
                                   <span className="text-slate-700 font-medium">{it.story_points}</span>
@@ -798,6 +942,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                                     no&nbsp;estimate
                                   </span>
                                 )}
+                                {spChanged && (
+                                  <div className="text-[9px] text-violet-600 font-medium whitespace-nowrap mt-0.5"
+                                       title={`SP changed since ${new Date(prev.prev_snapshot_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}`}>
+                                    ↑ from {prev.prev_story_points ?? "none"}
+                                  </div>
+                                )}
                               </td>
                               <td className="px-3 py-2.5 text-right tabular-nums">
                                 <span className={`font-medium ${hasEstimate ? "text-slate-900" : "text-slate-400"}`}>{w}</span>
@@ -806,9 +956,25 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                                 {ed}<span className="text-[10px] text-slate-400 ml-0.5">d</span>
                               </td>
                               <td className="px-3 py-2.5">{laneBadge(lane)}</td>
-                              <td className="px-3 py-2.5">{statusBadge(it.status)}</td>
-                              <td className="px-3 py-2.5 text-xs text-slate-500">
-                                {it.assigned_at ? new Date(it.assigned_at).toLocaleDateString(undefined, { day: "numeric", month: "short" }) : "—"}
+                              <td className="px-3 py-2.5">
+                                <div className="flex flex-col gap-0.5">
+                                  {statusBadge(it.status)}
+                                  {statusChanged && (
+                                    <span title={`Status changed since ${new Date(prev.prev_snapshot_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}`}
+                                          className={`text-[9px] font-medium whitespace-nowrap ${
+                                            it.status === "done" ? "text-emerald-700" : "text-violet-600"
+                                          }`}>
+                                      {it.status === "done" ? "✓ completed today" : `↻ from ${prev.prev_status ?? "—"}`}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2.5 text-xs">
+                                {it.effective_assigned_at ? (
+                                  <span className={wasReassigned ? "text-violet-700 font-medium" : "text-slate-500"}>
+                                    {new Date(it.effective_assigned_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                                  </span>
+                                ) : "—"}
                               </td>
                             </tr>
                           );
