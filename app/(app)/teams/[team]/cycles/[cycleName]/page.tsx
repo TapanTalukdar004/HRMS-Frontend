@@ -6,6 +6,7 @@ import {
   getCycleIssuesByEmployee,
   getCycleIssuesAcrossSnapshots,
   getCyclePreviousSnapshotChanges,
+  getCrossCyclePriorAppearance,
   getCycleCompleteness,
   listTeams,
 } from "@/lib/queries";
@@ -264,10 +265,11 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   // in the cycle (and got dropped by Esha because they finished early
   // or briefly had no active work) stay visible with their last-known
   // state.  See getCycleIssuesAcrossSnapshots for the rationale.
-  const [crossSnap, completenessByEmployee, prevChangesByIssue] = await Promise.all([
-    getCycleIssuesAcrossSnapshots(team, cycleName, selected.cycle_id),
+  const [crossSnap, completenessByEmployee, prevChangesByIssue, priorCycleByIssue] = await Promise.all([
+    getCycleIssuesAcrossSnapshots(team, cycleName, selected.cycle_id, selected.snapshot_at),
     getCycleCompleteness(selected.cycle_id),
-    getCyclePreviousSnapshotChanges(team, cycleName),
+    getCyclePreviousSnapshotChanges(team, cycleName, selected.snapshot_at),
+    getCrossCyclePriorAppearance(team, cycleName),
   ]);
   const issuesByEmployee = crossSnap.issuesByEmployee;
   const lastSeenByEmployee = crossSnap.lastSeenByEmployee;
@@ -282,7 +284,7 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
     : "2099-12-31T23:59:59Z";
 
   return (
-    <main className="max-w-7xl mx-auto px-8 py-10">
+    <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
       <BackButton
         fallbackHref={`/teams/${encodeURIComponent(team)}`}
         fallbackLabel={`Back to ${team}`}
@@ -776,101 +778,102 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
               const complete = completenessByEmployee[empName];
               const isTruncated = complete?.status === "truncated";
               const reassignedAway = reassignedAwayCount[empName] ?? 0;
+              // Cross-cycle lineage for this employee's issues:
+              //  - carried over from a prior cycle (same person)
+              //  - inherited via cross-cycle reassignment (different person prior)
+              let carriedOverCount = 0;
+              let crossCycleInheritedCount = 0;
+              for (const it of issues) {
+                const prior = priorCycleByIssue[it.issue_id];
+                if (!prior) continue;
+                if (prior.prior_employee === empName) carriedOverCount++;
+                else crossCycleInheritedCount++;
+              }
               const pctStr = score.pctComplete !== null
                 ? `${Math.round(score.pctComplete * 100)}%`
                 : "—";
               return (
                 <details key={empName}
                          className="group bg-white rounded-xl border border-stone-200 overflow-hidden hover:border-stone-300 transition-colors">
-                  <summary className="cursor-pointer list-none px-4 py-3.5 hover:bg-stone-50/60 select-none">
-                    <div className="flex items-center justify-between gap-4 flex-wrap">
-                      <div className="flex items-center gap-3 min-w-0">
-                        <span className="text-slate-400 group-open:rotate-90 transition-transform inline-block w-3 flex-none">▸</span>
-                        {/* Avatar disc with initial */}
-                        <span className={`flex-none inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold ${
-                          score.classification === "high"   ? "bg-emerald-100 text-emerald-700"
-                          : score.classification === "mid"  ? "bg-amber-100 text-amber-700"
-                          : score.classification === "low"  ? "bg-rose-100 text-rose-700"
-                          :                                   "bg-stone-100 text-slate-500"
-                        }`}>
-                          {empName.charAt(0).toUpperCase()}
+                  <summary className="cursor-pointer list-none px-3 sm:px-4 py-3 hover:bg-stone-50/60 select-none">
+                    {/* Row 1 — identity + score (always fits) */}
+                    <div className="flex items-center gap-2.5">
+                      <span className="text-slate-400 group-open:rotate-90 transition-transform inline-block w-3 flex-none">▸</span>
+                      <span className={`flex-none inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold ${
+                        score.classification === "high"   ? "bg-emerald-100 text-emerald-700"
+                        : score.classification === "mid"  ? "bg-amber-100 text-amber-700"
+                        : score.classification === "low"  ? "bg-rose-100 text-rose-700"
+                        :                                   "bg-stone-100 text-slate-500"
+                      }`}>
+                        {empName.charAt(0).toUpperCase()}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium text-slate-900 truncate">{empName}</div>
+                        <div className="text-[11px] text-slate-500 tabular-nums">
+                          {issues.length} issue{issues.length !== 1 ? "s" : ""} · weight {score.weightDone}/{score.weightTotal} · {pctStr}
+                        </div>
+                      </div>
+                      {/* Progress bar — desktop only */}
+                      <div className="hidden sm:block w-20 flex-none">
+                        <div className="h-1.5 rounded-full bg-stone-100 overflow-hidden">
+                          <div className={`h-full transition-all ${
+                            score.classification === "high"   ? "bg-emerald-500"
+                            : score.classification === "mid"  ? "bg-amber-500"
+                            : "bg-rose-400"
+                          }`} style={{ width: `${Math.round((score.pctComplete ?? 0) * 100)}%` }} />
+                        </div>
+                      </div>
+                      <span className="flex-none">{classBadge(score.classification === "no_data" ? null : score.classification)}</span>
+                    </div>
+
+                    {/* Row 2 — badges + lane chips, wrap freely (no overflow) */}
+                    <div className="flex flex-wrap items-center gap-1.5 mt-2 pl-[26px]">
+                      {/* Lane chips */}
+                      {score.lanes.normal > 0 && (
+                        <span className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-medium tabular-nums">{score.lanes.normal} normal</span>
+                      )}
+                      {score.lanes.tight > 0 && (
+                        <span className="text-[10px] bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded font-medium tabular-nums">{score.lanes.tight} tight</span>
+                      )}
+                      {score.lanes.late_dump > 0 && (
+                        <span title="assigned with too little time — excluded from score, shown to PM"
+                              className="text-[10px] bg-rose-50 text-rose-700 px-1.5 py-0.5 rounded font-medium tabular-nums">{score.lanes.late_dump} late-dump</span>
+                      )}
+                      {isTruncated && (
+                        <span title={complete?.parser_warning ?? "data was truncated this snapshot"}
+                              className="text-[10px] bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                          ⚠ truncated · {complete.n_issues_received}{complete.n_issues_expected !== null && (<>/{complete.n_issues_expected}</>)}
                         </span>
-                        <div className="min-w-0">
-                          <div className="font-medium text-slate-900 truncate">{empName}</div>
-                          <div className="text-[11px] text-slate-500 tabular-nums">
-                            {issues.length} issue{issues.length !== 1 ? "s" : ""} · weight {score.weightDone}/{score.weightTotal}
-                          </div>
-                        </div>
-                        {isTruncated && (
-                          <span title={complete?.parser_warning ?? "data was truncated this snapshot"}
-                                className="ml-2 inline-block text-[10px] bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-2 py-0.5 flex-none">
-                            ⚠ truncated · {complete.n_issues_received}
-                            {complete.n_issues_expected !== null && (<>/{complete.n_issues_expected}</>)}
+                      )}
+                      {reassignedAway > 0 && (
+                        <span title={`${reassignedAway} issue(s) this person started but no longer has. Does NOT affect score.`}
+                              className="text-[10px] bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                          ↻ {reassignedAway} reassigned away
+                        </span>
+                      )}
+                      {crossCycleInheritedCount > 0 && (
+                        <span title={`${crossCycleInheritedCount} issue(s) reassigned to this person from a PREVIOUS cycle.`}
+                              className="text-[10px] bg-violet-50 text-violet-700 ring-1 ring-inset ring-violet-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                          ↻ {crossCycleInheritedCount} inherited
+                        </span>
+                      )}
+                      {carriedOverCount > 0 && (
+                        <span title={`${carriedOverCount} issue(s) carried over from a previous cycle (still theirs).`}
+                              className="text-[10px] bg-stone-100 text-slate-500 ring-1 ring-inset ring-stone-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                          ↺ {carriedOverCount} carried over
+                        </span>
+                      )}
+                      {!currentEmployeeSet.has(empName) && !isTruncated && lastSeenByEmployee[empName] && (() => {
+                        const lastSeen = lastSeenByEmployee[empName];
+                        const isAllDone = issues.length > 0 && issues.every(i => isCompleted(i));
+                        const cls = isAllDone ? "bg-emerald-50 text-emerald-700 ring-emerald-200" : "bg-violet-50 text-violet-700 ring-violet-200";
+                        return (
+                          <span title={`Not in today's snapshot. Last seen ${new Date(lastSeen).toLocaleDateString(undefined, { day: "numeric", month: "short" })}.`}
+                                className={`text-[10px] ${cls} ring-1 ring-inset rounded-full px-2 py-0.5 whitespace-nowrap`}>
+                            {isAllDone ? "✓ completed early" : "↻ carried over"} · {new Date(lastSeen).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
                           </span>
-                        )}
-                        {/* Carried-over badge: this employee wasn't in
-                            today's Esha payload but appeared in an
-                            earlier snapshot of the same cycle.  Could be:
-                            (a) finished early & dropped by Esha's filter
-                            (b) on PTO / context-switched, will reappear
-                            We show their last-known state either way. */}
-                        {/* Soft HR signal: how many issues used to be
-                            this person's but now belong to someone else.
-                            Doesn't affect score — just visibility. */}
-                        {reassignedAway > 0 && (
-                          <span title={`${reassignedAway} issue${reassignedAway === 1 ? "" : "s"} this person started but no longer has (reassigned to someone else). This DOES NOT affect their score. Soft HR signal — may indicate workload rebalancing or a fit conversation.`}
-                                className="ml-2 inline-block text-[10px] bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-200 rounded-full px-2 py-0.5 flex-none whitespace-nowrap">
-                            ↻ {reassignedAway} reassigned away
-                          </span>
-                        )}
-                        {!currentEmployeeSet.has(empName) && !isTruncated && lastSeenByEmployee[empName] && (() => {
-                          const lastSeen = lastSeenByEmployee[empName];
-                          const isAllDone = issues.length > 0 && issues.every(i => isCompleted(i));
-                          const label = isAllDone ? "completed early" : "carried over";
-                          const cls = isAllDone
-                            ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
-                            : "bg-violet-50 text-violet-700 ring-violet-200";
-                          return (
-                            <span title={`Not in today's snapshot. Last seen ${new Date(lastSeen).toLocaleDateString(undefined, { day: "numeric", month: "short" })}. Showing their last-known issues for this cycle.`}
-                                  className={`ml-2 inline-block text-[10px] ${cls} ring-1 ring-inset rounded-full px-2 py-0.5 flex-none whitespace-nowrap`}>
-                              {isAllDone ? "✓" : "↻"} {label} · last seen {new Date(lastSeen).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
-                            </span>
-                          );
-                        })()}
-                      </div>
-                      <div className="flex items-center gap-4">
-                        {/* Lane mini-chips */}
-                        <div className="hidden md:flex items-center gap-1 text-[10px]">
-                          {score.lanes.normal > 0 && (
-                            <span className="bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-medium tabular-nums">
-                              {score.lanes.normal} normal
-                            </span>
-                          )}
-                          {score.lanes.tight > 0 && (
-                            <span className="bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded font-medium tabular-nums">
-                              {score.lanes.tight} tight
-                            </span>
-                          )}
-                          {score.lanes.late_dump > 0 && (
-                            <span title="assigned with too little time — excluded from score, shown to PM"
-                                  className="bg-rose-50 text-rose-700 px-1.5 py-0.5 rounded font-medium tabular-nums">
-                              {score.lanes.late_dump} late-dump
-                            </span>
-                          )}
-                        </div>
-                        {/* Weight progress mini-bar */}
-                        <div className="hidden sm:block w-24">
-                          <div className="h-1.5 rounded-full bg-stone-100 overflow-hidden">
-                            <div className={`h-full transition-all ${
-                              score.classification === "high"   ? "bg-emerald-500"
-                              : score.classification === "mid"  ? "bg-amber-500"
-                              : "bg-rose-400"
-                            }`} style={{ width: `${Math.round((score.pctComplete ?? 0) * 100)}%` }} />
-                          </div>
-                          <div className="text-[10px] text-slate-400 mt-0.5 text-right tabular-nums">{pctStr}</div>
-                        </div>
-                        <span>{classBadge(score.classification === "no_data" ? null : score.classification)}</span>
-                      </div>
+                        );
+                      })()}
                     </div>
                   </summary>
 
@@ -907,6 +910,10 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                           const priorityChanged = prev && prev.prev_priority !== it.priority;
                           const spChanged       = prev && prev.prev_story_points !== it.story_points;
                           const statusChanged   = prev && prev.prev_status !== it.status;
+                          // Cross-cycle lineage
+                          const priorCycle = priorCycleByIssue[it.issue_id];
+                          const crossCycleReassigned = priorCycle && priorCycle.prior_employee !== empName;
+                          const crossCycleCarried    = priorCycle && priorCycle.prior_employee === empName;
                           return (
                             <tr key={it.issue_id}
                                 className={`border-t border-stone-100 ${done ? "bg-emerald-50/20" : ""}`}>
@@ -918,6 +925,25 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                                     <span title={`Reassigned from ${it.reassigned_from} on ${new Date(it.reassigned_at!).toLocaleDateString(undefined, { day: "numeric", month: "short" })}. Schedule fit is calculated from the date this person got it, not the issue's original creation date.`}
                                           className="inline-block text-[10px] bg-violet-50 text-violet-700 ring-1 ring-inset ring-violet-200 rounded-full px-2 py-0.5 whitespace-nowrap">
                                       ↻ reassigned from <b>{it.reassigned_from}</b> on {new Date(it.reassigned_at!).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                                    </span>
+                                  </div>
+                                )}
+                                {/* Cross-cycle reassignment — prominent. This issue
+                                    belonged to a DIFFERENT person in a prior cycle. */}
+                                {crossCycleReassigned && (
+                                  <div className="mt-0.5">
+                                    <span title={`This issue was held by ${priorCycle.prior_employee} in ${priorCycle.prior_cycle}. It was reassigned to ${empName} for this cycle.`}
+                                          className="inline-block text-[10px] bg-violet-100 text-violet-800 ring-1 ring-inset ring-violet-300 rounded-full px-2 py-0.5 whitespace-nowrap font-medium">
+                                      ↻ reassigned from <b>{priorCycle.prior_employee}</b> · {priorCycle.prior_cycle}
+                                    </span>
+                                  </div>
+                                )}
+                                {/* Carried over (same person, prior cycle) — subtle. */}
+                                {crossCycleCarried && (
+                                  <div className="mt-0.5">
+                                    <span title={`This issue was also on ${empName}'s plate in ${priorCycle.prior_cycle} — it's been carried over (not completed last cycle).`}
+                                          className="inline-block text-[9px] text-slate-400 whitespace-nowrap">
+                                      ↺ carried from {priorCycle.prior_cycle}
                                     </span>
                                   </div>
                                 )}

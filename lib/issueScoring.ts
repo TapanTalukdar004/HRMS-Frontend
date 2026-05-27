@@ -254,3 +254,83 @@ export function computeEmployeeScore(
     explanation,
   };
 }
+
+// ─── Cycle performance metric (mirrors scoring.py) ─────────────────────────
+
+export const TIMELINESS_MAX_BONUS = 0.5;   // bonus only — never a penalty
+
+export type CyclePerformance = {
+  throughput: number;               // 0..1 weighted completion
+  onTimeRate: number | null;        // 0..1 of ESTIMATED completed; null if none judged
+  baseScore: number | null;         // 0..10 from throughput alone
+  cycleScore: number | null;        // 0..10 = base + timeliness BONUS (>= base)
+  classification: "high" | "mid" | "low" | "no_data";
+  weightDone: number;
+  weightTotal: number;
+  nCompleted: number;
+  nCounted: number;
+  nTotal: number;
+  lanes: Record<Lane, number>;
+};
+
+/** True if a COMPLETED, ESTIMATED issue was done within its fair window.
+ *  null when not completed, not estimated, or dates missing.
+ *  Fair window starts at max(assigned_at, cycle_start) so carry-overs get
+ *  a fresh window each cycle (no "target stuck in the past"). */
+function issueOnTime(
+  issue: Issue & { effective_assigned_at?: string | null },
+  cycleStart: string | Date | null,
+): boolean | null {
+  if (!isCompleted(issue)) return null;
+  if (!hasSpEstimate(issue)) return null;   // don't judge unestimated work
+  const completedMs = issue.completed_at ? Date.parse(issue.completed_at) : NaN;
+  const assignedStr = issue.effective_assigned_at ?? issue.assigned_at ?? null;
+  const assignedMs = assignedStr ? Date.parse(assignedStr) : NaN;
+  if (Number.isNaN(completedMs) || Number.isNaN(assignedMs)) return null;
+  const startMs = cycleStart
+    ? (typeof cycleStart === "string" ? Date.parse(cycleStart) : cycleStart.getTime())
+    : NaN;
+  const windowStart = Number.isNaN(startMs) ? assignedMs : Math.max(assignedMs, startMs);
+  const targetMs = windowStart + computeExpectedDays(issue) * 86_400_000;
+  return completedMs <= targetMs;
+}
+
+export function computeCyclePerformance(
+  issues: (Issue & { effective_assigned_at?: string | null })[],
+  cycleEnd: string | Date,
+  cycleStart: string | Date | null = null,
+): CyclePerformance {
+  const es = computeEmployeeScore(issues, cycleEnd);
+  const base = es.score0to10;
+
+  const completed = issues.filter(isCompleted);
+  const judged = issues
+    .map((it) => issueOnTime(it, cycleStart))
+    .filter((f): f is boolean => f !== null);
+  const onTimeRate = judged.length > 0
+    ? judged.filter(Boolean).length / judged.length
+    : null;
+
+  let cycleScore: number | null = null;
+  if (base !== null) {
+    // BONUS ONLY: 0..1 → +0..+0.5. Never below base. Late/incomplete is
+    // not penalised here (throughput already reflects it).
+    const rate = onTimeRate ?? 0;
+    const bonus = rate * TIMELINESS_MAX_BONUS;
+    cycleScore = Math.round(Math.min(10, base + bonus) * 100) / 100;
+  }
+
+  return {
+    throughput: es.pctComplete ?? 0,
+    onTimeRate,
+    baseScore: base,
+    cycleScore,
+    classification: es.classification,
+    weightDone: es.weightDone,
+    weightTotal: es.weightTotal,
+    nCompleted: completed.length,
+    nCounted: (es.lanes.normal ?? 0) + (es.lanes.tight ?? 0),
+    nTotal: issues.length,
+    lanes: es.lanes,
+  };
+}

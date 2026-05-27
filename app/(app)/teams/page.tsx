@@ -54,7 +54,7 @@ export default async function TeamsPage() {
   const teams = await listTeams();
 
   return (
-    <main className="max-w-7xl mx-auto px-8 py-10">
+    <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
       <div className="flex items-end justify-between mb-8">
         <div>
           <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Teams</h1>

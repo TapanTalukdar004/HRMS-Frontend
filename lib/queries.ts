@@ -277,76 +277,129 @@ export type SnapshotCompleteness = {
   parser_warning: string | null;
 };
 
-/** One employee's full issue history grouped by cycle.
- *  Returns: {cycle_name: {cycle_id, team, cycle_start, cycle_end, snapshot_at, issues[]}}
- *  Used by the employee profile page to show what they had on their
- *  plate across each cycle (cycle-wise breakdown).
+/** One employee's full issue history grouped by CYCLE NAME (not by
+ *  snapshot).  Each cycle appears ONCE, consolidating every snapshot of
+ *  that cycle the employee appeared in.  Per issue we keep both the
+ *  LATEST state and the FIRST-seen state so the UI can render a change
+ *  report (newly assigned, completed, priority/SP changed, reassigned).
  */
+export type EmployeeCycleIssue = CycleIssue & {
+  first_seen_at: string;             // first snapshot this employee held it
+  first_priority: string | null;
+  first_story_points: number | null;
+  first_status: string | null;
+};
+
 export type EmployeeCycleBucket = {
-  cycle_id: string;
   cycle_name: string;
   team: string | null;
   cycle_start: string | null;
   cycle_end: string | null;
-  snapshot_at: string;
-  issues: CycleIssue[];
+  snapshot_at: string;               // latest snapshot of this cycle the emp was in
+  issues: EmployeeCycleIssue[];
 };
 
 export async function getIssuesForEmployeeByCycle(
   employeeName: string,
 ): Promise<EmployeeCycleBucket[]> {
-  // First: discover which cycles this person appears in.
-  const cycles = await q<{ cycle_id: string; cycle_name: string; team: string | null;
-                          cycle_start: string | null; cycle_end: string | null;
-                          snapshot_at: string }>(
+  // One row per (cycle_name, issue): the LATEST state this employee held
+  // it in, plus the FIRST-seen state, plus the cycle's metadata.  Grouping
+  // by cycle_name (not the per-snapshot cycle_id) consolidates multiple
+  // daily snapshots of the same cycle into a single bucket.
+  const rows = await q<EmployeeCycleIssue & {
+    cycle_name: string;
+    team: string | null;
+    cycle_start: string | null;
+    cycle_end: string | null;
+  }>(
     `
-    SELECT DISTINCT
-      pc.id          AS cycle_id,
-      pc.cycle_name,
-      pc.team,
-      pc.cycle_start::text,
-      pc.cycle_end::text,
-      COALESCE(pc.snapshot_at, pc.received_at)::text AS snapshot_at
-    FROM cycle_employee_issues cei
-    JOIN performance_cycles pc ON pc.id = cei.cycle_id
-    WHERE cei.employee_name = $1
-    ORDER BY snapshot_at DESC
-    `,
-    [employeeName],
-  );
-  if (cycles.length === 0) return [];
-
-  // Then: fetch the latest snapshot of every issue this person has, across all cycles.
-  const issues = await q<CycleIssue>(
-    `
-    WITH latest AS (
-      SELECT DISTINCT ON (cycle_id, issue_id)
-        id, cycle_id, employee_name, employee_id, issue_id, title,
-        issue_type, priority, story_points, status, labels,
-        assigned_at, completed_at, snapshot_at
-      FROM cycle_employee_issues
-      WHERE employee_name = $1
-      ORDER BY cycle_id, issue_id, snapshot_at DESC
+    WITH all_rows AS (
+      -- ALL employees (not filtered) — needed to find the global holder.
+      SELECT
+        pc.cycle_name, pc.team,
+        pc.cycle_start, pc.cycle_end,
+        COALESCE(pc.snapshot_at, pc.received_at) AS snap,
+        cei.*
+      FROM cycle_employee_issues cei
+      JOIN performance_cycles pc ON pc.id = cei.cycle_id
+    ),
+    global_holder AS (
+      -- Who CURRENTLY holds each (cycle, issue) — the globally-latest row.
+      -- If an issue was reassigned, this is the new holder.  If it's just
+      -- missing/truncated (no one else has it), this stays the last holder.
+      SELECT DISTINCT ON (cycle_name, issue_id)
+        cycle_name, issue_id, employee_name AS holder
+      FROM all_rows
+      ORDER BY cycle_name, issue_id, snap DESC
+    ),
+    emp_rows AS (
+      SELECT * FROM all_rows WHERE employee_name = $1
+    ),
+    latest AS (
+      SELECT DISTINCT ON (cycle_name, issue_id)
+        cycle_name, team, cycle_start, cycle_end,
+        issue_id, employee_name, employee_id, title, issue_type,
+        priority, story_points, status, labels, assigned_at, completed_at,
+        snap AS snapshot_at
+      FROM emp_rows
+      ORDER BY cycle_name, issue_id, snap DESC
+    ),
+    first_seen AS (
+      SELECT DISTINCT ON (cycle_name, issue_id)
+        cycle_name, issue_id,
+        snap        AS first_seen_at,
+        priority    AS first_priority,
+        story_points AS first_story_points,
+        status      AS first_status
+      FROM emp_rows
+      ORDER BY cycle_name, issue_id, snap ASC
+    ),
+    cycle_latest_snap AS (
+      SELECT cycle_name, MAX(snap) AS latest_snap
+      FROM emp_rows GROUP BY cycle_name
     )
-    SELECT * FROM latest
-    ORDER BY cycle_id, priority NULLS LAST, issue_id
+    SELECT
+      l.cycle_name, l.team,
+      l.cycle_start::text, l.cycle_end::text,
+      cls.latest_snap::text AS snapshot_at,
+      '' AS id, ''::text AS cycle_id,
+      l.employee_name, l.employee_id::text AS employee_id,
+      l.issue_id, l.title, l.issue_type, l.priority, l.story_points,
+      l.status, l.labels,
+      l.assigned_at::text, l.completed_at::text,
+      f.first_seen_at::text, f.first_priority, f.first_story_points, f.first_status
+    FROM latest l
+    JOIN first_seen f ON f.cycle_name = l.cycle_name AND f.issue_id = l.issue_id
+    JOIN cycle_latest_snap cls ON cls.cycle_name = l.cycle_name
+    JOIN global_holder g ON g.cycle_name = l.cycle_name AND g.issue_id = l.issue_id
+    -- Keep the issue under this person ONLY if they're still the current
+    -- global holder.  Truncated (forgotten) issues → still theirs.
+    -- Reassigned-away issues → now belong to someone else, excluded here.
+    WHERE g.holder = $1
+    ORDER BY cls.latest_snap DESC, l.priority NULLS LAST, l.issue_id
     `,
     [employeeName],
   );
+  if (rows.length === 0) return [];
 
-  const byId: Record<string, CycleIssue[]> = {};
-  for (const it of issues) {
-    (byId[it.cycle_id] ??= []).push(it);
+  // Group into one bucket per cycle_name, preserving the DESC snapshot order.
+  const order: string[] = [];
+  const byCycle: Record<string, EmployeeCycleBucket> = {};
+  for (const r of rows) {
+    if (!byCycle[r.cycle_name]) {
+      order.push(r.cycle_name);
+      byCycle[r.cycle_name] = {
+        cycle_name: r.cycle_name,
+        team: r.team,
+        cycle_start: r.cycle_start,
+        cycle_end: r.cycle_end,
+        snapshot_at: r.snapshot_at,
+        issues: [],
+      };
+    }
+    byCycle[r.cycle_name].issues.push(r);
   }
-  return cycles.map(c => ({
-    cycle_id: c.cycle_id,
-    cycle_name: c.cycle_name,
-    team: c.team,
-    cycle_start: c.cycle_start,
-    cycle_end: c.cycle_end,
-    snapshot_at: c.snapshot_at,
-    issues: byId[c.cycle_id] ?? [],
-  }));
+  return order.map(name => byCycle[name]);
 }
 
 /** Cross-snapshot, REASSIGNMENT-AWARE view of a cycle's issues.
@@ -381,6 +434,61 @@ export type CycleIssueWithReassignment = CycleIssue & {
   reassigned_at: string | null;         // when reassignment happened
 };
 
+/** Cross-CYCLE lineage: for each issue in the given cycle, find whether
+ *  it also appeared in an EARLIER cycle (different cycle_name, earlier
+ *  dates) and who held it then.  Lets the dashboard flag:
+ *    • carried over   — same person held it last cycle too
+ *    • reassigned     — a DIFFERENT person held it in the prior cycle
+ *  This is the "is this person inheriting / losing work across cycles"
+ *  signal HR asked for.  One cheap query per cycle-page load.
+ */
+export type PriorCycleAppearance = {
+  issue_id: string;
+  prior_employee: string;
+  prior_cycle: string;
+  prior_snapshot_at: string;
+};
+
+export async function getCrossCyclePriorAppearance(
+  team: string,
+  cycleName: string,
+): Promise<Record<string, PriorCycleAppearance>> {
+  const rows = await q<PriorCycleAppearance>(
+    `
+    WITH cur_cycle_start AS (
+      SELECT MIN(COALESCE(snapshot_at, received_at)) AS snap
+      FROM performance_cycles WHERE team = $1 AND cycle_name = $2
+    ),
+    cur_issues AS (
+      SELECT DISTINCT cei.issue_id
+      FROM cycle_employee_issues cei
+      JOIN performance_cycles pc ON pc.id = cei.cycle_id
+      WHERE pc.team = $1 AND pc.cycle_name = $2
+    ),
+    prior AS (
+      SELECT DISTINCT ON (cei.issue_id)
+        cei.issue_id,
+        cei.employee_name              AS prior_employee,
+        pc.cycle_name                  AS prior_cycle,
+        COALESCE(pc.snapshot_at, pc.received_at)::text AS prior_snapshot_at
+      FROM cycle_employee_issues cei
+      JOIN performance_cycles pc ON pc.id = cei.cycle_id
+      WHERE cei.issue_id IN (SELECT issue_id FROM cur_issues)
+        AND pc.team = $1
+        AND pc.cycle_name <> $2
+        AND COALESCE(pc.snapshot_at, pc.received_at) < (SELECT snap FROM cur_cycle_start)
+      ORDER BY cei.issue_id, COALESCE(pc.snapshot_at, pc.received_at) DESC
+    )
+    SELECT issue_id, prior_employee, prior_cycle, prior_snapshot_at FROM prior
+    `,
+    [team, cycleName],
+  );
+  const byId: Record<string, PriorCycleAppearance> = {};
+  for (const r of rows) byId[r.issue_id] = r;
+  return byId;
+}
+
+
 export type CycleCrossSnapshotResult = {
   /** Issues grouped by their CURRENT assignee.  Each issue appears
    *  exactly once (under whoever holds it now). */
@@ -399,9 +507,13 @@ export async function getCycleIssuesAcrossSnapshots(
   team: string,
   cycleName: string,
   currentCycleId: string,
+  asOfSnapshotAt: string,
 ): Promise<CycleCrossSnapshotResult> {
-  // Pull every (issue, assignee) seen in this cycle, plus the FIRST
-  // and LAST snapshot_at that assignee held it.  Done in one query.
+  // "As-of" semantics: only consider snapshots up to and including the
+  // SELECTED one (asOfSnapshotAt).  This makes the per-issue view reflect
+  // the state ON the date the user picked in the snapshot date picker —
+  // not the latest-ever state.  Viewing May 26 shows each issue's May 26
+  // state; viewing May 27 shows May 27 state.
   const rows = await q<{
     issue_id: string;
     employee_name: string;
@@ -424,6 +536,7 @@ export async function getCycleIssuesAcrossSnapshots(
       SELECT id, COALESCE(snapshot_at, received_at) AS snap
       FROM performance_cycles
       WHERE team = $1 AND cycle_name = $2
+        AND COALESCE(snapshot_at, received_at) <= $3::timestamptz
     ),
     all_rows AS (
       SELECT cei.*
@@ -469,7 +582,7 @@ export async function getCycleIssuesAcrossSnapshots(
     SELECT * FROM ranked
     ORDER BY issue_id, assignee_rank
     `,
-    [team, cycleName],
+    [team, cycleName, asOfSnapshotAt],
   );
 
   // Build maps: current assignee per issue, previous assignee per issue.
@@ -548,14 +661,16 @@ export async function getCycleIssuesAcrossSnapshots(
 }
 
 
-/** For each issue in this cycle, return the state it had in the
- *  immediately-prior snapshot (one row per issue that has a prior).
- *  Used to render "what changed since yesterday" indicators on the
- *  cycle page — priority bumps, SP changes, status flips, reassigns.
+/** For the SELECTED snapshot date, return how each issue differs from
+ *  the snapshot immediately BEFORE it.  Drives the "what changed since
+ *  previous snapshot" card + the per-row "↑ from X" indicators.
  *
- *  Returns ONLY issues whose properties differ from the most recent
- *  prior snapshot.  If an issue was unchanged, it's omitted (the UI
- *  has nothing to flag).
+ *  "As-of" semantics — both sides are computed relative to a date:
+ *    • current  = each issue's latest state on/before `asOfSnapshotAt`
+ *    • previous = each issue's latest state on/before the snapshot that
+ *                 comes immediately before `asOfSnapshotAt`
+ *  So selecting May 26 diffs May 26 vs May 25; selecting May 27 diffs
+ *  May 27 vs May 26.  Only changed issues are returned.
  */
 export type PreviousIssueState = {
   issue_id: string;
@@ -563,12 +678,13 @@ export type PreviousIssueState = {
   prev_story_points: number | null;
   prev_status: string | null;
   prev_employee_name: string;
-  prev_snapshot_at: string;
+  prev_snapshot_at: string;   // the boundary date the "previous" state is as-of
 };
 
 export async function getCyclePreviousSnapshotChanges(
   team: string,
   cycleName: string,
+  asOfSnapshotAt: string,
 ): Promise<Record<string, PreviousIssueState>> {
   const rows = await q<PreviousIssueState>(
     `
@@ -577,29 +693,39 @@ export async function getCyclePreviousSnapshotChanges(
       FROM performance_cycles
       WHERE team = $1 AND cycle_name = $2
     ),
-    history AS (
-      SELECT
-        cei.issue_id,
-        cei.employee_name,
-        cei.priority,
-        cei.story_points,
-        cei.status,
-        cei.snapshot_at,
-        ROW_NUMBER() OVER (
-          PARTITION BY cei.issue_id ORDER BY cei.snapshot_at DESC
-        ) AS rn
-      FROM cycle_employee_issues cei
-      JOIN cycle_snapshots cs ON cs.id = cei.cycle_id
+    sel AS (SELECT $3::timestamptz AS snap),
+    -- The boundary for "previous": the latest snapshot strictly before
+    -- the selected one.  NULL when the selected snapshot is the first.
+    prev_boundary AS (
+      SELECT MAX(snap) AS snap
+      FROM cycle_snapshots
+      WHERE snap < (SELECT snap FROM sel)
     ),
-    cur AS (SELECT * FROM history WHERE rn = 1),
-    prv AS (SELECT * FROM history WHERE rn = 2)
+    -- Each issue's state AS-OF the selected date.
+    cur AS (
+      SELECT DISTINCT ON (cei.issue_id)
+        cei.issue_id, cei.employee_name, cei.priority,
+        cei.story_points, cei.status
+      FROM cycle_employee_issues cei
+      WHERE cei.snapshot_at <= (SELECT snap FROM sel)
+      ORDER BY cei.issue_id, cei.snapshot_at DESC
+    ),
+    -- Each issue's state AS-OF the previous-snapshot boundary.
+    prv AS (
+      SELECT DISTINCT ON (cei.issue_id)
+        cei.issue_id, cei.employee_name, cei.priority,
+        cei.story_points, cei.status
+      FROM cycle_employee_issues cei
+      WHERE cei.snapshot_at <= (SELECT snap FROM prev_boundary)
+      ORDER BY cei.issue_id, cei.snapshot_at DESC
+    )
     SELECT
       cur.issue_id,
       prv.priority           AS prev_priority,
       prv.story_points       AS prev_story_points,
       prv.status             AS prev_status,
       prv.employee_name      AS prev_employee_name,
-      prv.snapshot_at::text  AS prev_snapshot_at
+      (SELECT snap FROM prev_boundary)::text AS prev_snapshot_at
     FROM cur
     JOIN prv ON prv.issue_id = cur.issue_id
     WHERE
@@ -608,7 +734,7 @@ export async function getCyclePreviousSnapshotChanges(
       OR COALESCE(cur.status, '')                   IS DISTINCT FROM COALESCE(prv.status, '')
       OR cur.employee_name                          IS DISTINCT FROM prv.employee_name
     `,
-    [team, cycleName],
+    [team, cycleName, asOfSnapshotAt],
   );
   const byId: Record<string, PreviousIssueState> = {};
   for (const r of rows) byId[r.issue_id] = r;
@@ -848,6 +974,67 @@ export async function getEmployeeTrend(employeeName: string): Promise<EmployeeTr
      JOIN performance_cycles pc ON pc.id = ces.cycle_id
      WHERE LOWER(ces.employee_name) = LOWER($1)
      ORDER BY COALESCE(pc.snapshot_at, pc.received_at)`,
+    [employeeName],
+  );
+}
+
+/** Gap-filled day-by-day trend for the graph.
+ *
+ *  Problem: getEmployeeTrend only returns days the employee actually
+ *  appeared in an Esha snapshot.  If Esha dropped them on a given day
+ *  (because they finished early or briefly had no active work), that
+ *  day has no point — the graph skips it (e.g. shivam's May 26 missing).
+ *
+ *  This version returns a point for EVERY snapshot date of every cycle
+ *  the employee participated in, carrying forward their last-known state
+ *  WITHIN that cycle on days they were absent.  Cross-cycle carry-forward
+ *  is intentionally NOT done (a Cycle 5 value never bleeds into Cycle 6).
+ */
+export async function getEmployeeTrendFilled(employeeName: string): Promise<EmployeeTrendPoint[]> {
+  return await q<EmployeeTrendPoint>(
+    `
+    WITH emp_cycles AS (
+      SELECT DISTINCT pc.cycle_name, pc.team
+      FROM cycle_employee_scores ces
+      JOIN performance_cycles pc ON pc.id = ces.cycle_id
+      WHERE LOWER(ces.employee_name) = LOWER($1)
+    ),
+    cycle_snaps AS (
+      SELECT pc.cycle_name, pc.team,
+             COALESCE(pc.snapshot_at, pc.received_at) AS snap
+      FROM performance_cycles pc
+      JOIN emp_cycles ec
+        ON ec.cycle_name = pc.cycle_name
+       AND COALESCE(ec.team, '') = COALESCE(pc.team, '')
+    ),
+    emp_scores AS (
+      SELECT pc.cycle_name,
+             COALESCE(pc.snapshot_at, pc.received_at) AS snap,
+             ces.tickets_completed, ces.tickets_total,
+             ces.story_points_completed, ces.story_points_total,
+             ces.raw_score, ces.classification, ces.final_score
+      FROM cycle_employee_scores ces
+      JOIN performance_cycles pc ON pc.id = ces.cycle_id
+      WHERE LOWER(ces.employee_name) = LOWER($1)
+    )
+    SELECT
+      cs.cycle_name,
+      cs.snap::text AS received_at,
+      cs.snap::text AS snapshot_at,
+      cs.team,
+      es.tickets_completed, es.tickets_total,
+      es.story_points_completed, es.story_points_total,
+      es.raw_score, es.classification, es.final_score
+    FROM cycle_snaps cs
+    LEFT JOIN LATERAL (
+      SELECT * FROM emp_scores e
+      WHERE e.cycle_name = cs.cycle_name AND e.snap <= cs.snap
+      ORDER BY e.snap DESC
+      LIMIT 1
+    ) es ON true
+    WHERE es.cycle_name IS NOT NULL   -- skip dates before the emp's first appearance in that cycle
+    ORDER BY cs.snap
+    `,
     [employeeName],
   );
 }
@@ -1515,4 +1702,79 @@ export async function getHomeStats(): Promise<HomeStats> {
     total_employees_tracked: Number(emp[0]?.n ?? 0),
     open_escalations: Number(esc[0]?.n ?? 0),
   };
+}
+
+// ─── issue_events reads (migration 020) ───────────────────────────────────
+
+export type IssueEventRow = {
+  issue_id: string;
+  cycle_name: string;
+  team: string | null;
+  employee_name: string | null;
+  prev_employee: string | null;
+  event_type: string;       // assigned|reassigned|priority_changed|sp_changed|status_changed|completed|reopened
+  old_value: string | null;
+  new_value: string | null;
+  occurred_at: string;
+};
+
+/** Full chronological lifeline of one issue across all cycles.
+ *  Powers the "life of an issue" view — every assignment, reassignment,
+ *  priority/SP/status change, completion, reopen — in one cheap query. */
+export async function getIssueLifeline(issueId: string): Promise<IssueEventRow[]> {
+  return await q<IssueEventRow>(
+    `SELECT issue_id, cycle_name, team, employee_name, prev_employee,
+            event_type, old_value, new_value, occurred_at::text
+     FROM issue_events
+     WHERE issue_id = $1
+     ORDER BY occurred_at ASC, created_at ASC`,
+    [issueId],
+  );
+}
+
+/** All change events for a cycle up to (and including) a given date.
+ *  Excludes the noisy bulk 'assigned' events by default so the feed
+ *  shows real changes (reassignments, priority/SP/status, completions). */
+export async function getCycleEventFeed(
+  team: string,
+  cycleName: string,
+  asOfSnapshotAt: string,
+  includeAssigned = false,
+): Promise<IssueEventRow[]> {
+  return await q<IssueEventRow>(
+    `SELECT issue_id, cycle_name, team, employee_name, prev_employee,
+            event_type, old_value, new_value, occurred_at::text
+     FROM issue_events
+     WHERE cycle_name = $1
+       AND COALESCE(team, '') = COALESCE($2, '')
+       AND occurred_at <= $3::timestamptz
+       AND ($4 OR event_type <> 'assigned')
+     ORDER BY occurred_at DESC, issue_id`,
+    [cycleName, team, asOfSnapshotAt, includeAssigned],
+  );
+}
+
+/** Per-employee event tallies for a quarter/period — HR analytics.
+ *  e.g. "who completed the most / received the most reassignments". */
+export type EmployeeEventStat = {
+  employee_name: string;
+  completed: number;
+  reassigned_in: number;     // issues reassigned TO this person
+};
+
+export async function getEmployeeEventStats(
+  startISO: string,
+  endISO: string,
+): Promise<EmployeeEventStat[]> {
+  return await q<EmployeeEventStat>(
+    `SELECT employee_name,
+            COUNT(*) FILTER (WHERE event_type = 'completed')  AS completed,
+            COUNT(*) FILTER (WHERE event_type = 'reassigned') AS reassigned_in
+     FROM issue_events
+     WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz
+       AND employee_name IS NOT NULL
+     GROUP BY employee_name
+     ORDER BY completed DESC, reassigned_in DESC`,
+    [startISO, endISO],
+  );
 }

@@ -24,7 +24,7 @@ export default async function TeamDetailPage({ params }: Props) {
   const cycles = await listCycleSummariesForTeam(team);
 
   return (
-    <main className="max-w-7xl mx-auto px-8 py-10">
+    <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
       <Link href="/teams" className="text-sm text-slate-500 hover:text-[#AE00D0]">
         ← Back to all teams
       </Link>
