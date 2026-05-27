@@ -54,7 +54,7 @@ export function EmployeeTrendChart({ data }: { data: EmployeeSnapshotPoint[] }) 
               fontSize: 12,
               boxShadow: "0 4px 12px rgba(15,23,42,0.06)",
             }}
-            formatter={(value: number, name: string) => [`${value}%`, name]}
+            formatter={(value, name) => [`${value ?? "—"}%`, String(name)]}
             labelFormatter={(label, items) => {
               const p = items?.[0]?.payload as EmployeeSnapshotPoint | undefined;
               return p?.cycle_name ? `${p.cycle_name} · ${label}` : label;
