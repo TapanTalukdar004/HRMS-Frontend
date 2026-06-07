@@ -23,7 +23,12 @@ import {
   qualityState,
   reopenCount,
   REWORK_PENALTY,
+  HOLD_CAP,
+  isBug,
+  isCorrective,
+  heldFeatureIds,
   type Lane,
+  type Issue,
 } from "@/lib/issueScoring";
 
 export const dynamic = "force-dynamic";
@@ -231,8 +236,15 @@ function computeTeamPulse(
   };
   const perEmployee: { name: string; pct: number | null; weightDone: number; weightTotal: number; classification: string }[] = [];
 
+  // BUG RETENTION: a feature with an OPEN linked bug is held at HOLD_CAP until
+  // it clears. Built once from the WHOLE cycle (bugs may belong to a different
+  // assignee than the feature owner). Passed into every score so Team Pulse,
+  // the per-person rows, and the employee page all agree.
+  const allCycleIssues: Issue[] = Object.values(issuesByEmployee).flat();
+  const held = heldFeatureIds(allCycleIssues);
+
   for (const [name, issues] of Object.entries(issuesByEmployee)) {
-    const score = computeEmployeeScore(issues, cycleEnd);
+    const score = computeEmployeeScore(issues, cycleEnd, held);
     perEmployee.push({
       name,
       pct: score.pctComplete,
@@ -254,9 +266,13 @@ function computeTeamPulse(
       if (isDone) doneIssues += 1;
       if (devDone) devCompleteIssues += 1;
 
-      // STATUS-AWARE: total = all non-excluded; done = credit-weighted.
+      // STATUS-AWARE + BUG RETENTION: total = all non-excluded; done uses the
+      // same effective credit as the per-person score (hold + corrective).
+      const heldHere = !isBug(it) && held.has(it.issue_id) && credit > HOLD_CAP;
+      let eff = heldHere ? HOLD_CAP : credit;
+      if (isCorrective(it)) eff *= REWORK_PENALTY;
       totalWeight += w;
-      doneWeight += w * credit;
+      doneWeight += w * eff;
 
       const pri = (it.priority || "other").toLowerCase();
       const bucket = pri === "p0" || pri === "p1" || pri === "p2" || pri === "low" ? pri : "other";
@@ -272,11 +288,14 @@ function computeTeamPulse(
   // difficulty-weighted progress delivered, accounting for quality. This is
   // the "who carried the cycle" measure, NOT raw completion % (which would
   // crown someone with one tiny finished ticket).
-  const byOutput = [...perEmployee].sort((a, b) => b.weightDone - a.weightDone);
+  // "unassigned" is the bucket of issues no one officially owns in Linear —
+  // never a person, so it's excluded from leaders / watch and shown last.
+  const realPeople = perEmployee.filter(p => p.name !== "unassigned");
+  const byOutput = [...realPeople].sort((a, b) => b.weightDone - a.weightDone);
   const topPerformers = byOutput.filter(p => p.weightDone > 0).slice(0, 3);
   // NEEDS ATTENTION = behind on a REAL load (so a lightly-loaded person who
   // did their bit isn't unfairly flagged). Low % + meaningful weight.
-  const watchList = perEmployee
+  const watchList = realPeople
     .filter(p => p.weightTotal >= 5 && (p.pct ?? 1) < 0.60)
     .sort((a, b) => (a.pct ?? 1) - (b.pct ?? 1))
     .slice(0, 3);
@@ -363,6 +382,10 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   // the old name for that path.
   const prevChangesByIssue = prevChanges.changes;
   const issuesByEmployee = crossSnap.issuesByEmployee;
+  // BUG RETENTION: cycle-wide set of features with an open linked bug (held at
+  // HOLD_CAP). Built once here so summary rows, the per-employee detail, and
+  // the issue-row badges all use the SAME hold the Team Pulse uses.
+  const held = heldFeatureIds(Object.values(issuesByEmployee).flat() as Issue[]);
   const lastSeenByEmployee = crossSnap.lastSeenByEmployee;
   const currentEmployeeSet = new Set(crossSnap.currentEmployeeNames);
   const reassignedAwayCount = crossSnap.reassignedAwayCount;
@@ -381,7 +404,7 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   // the previous snapshot (empty at a fresh baseline).
   const _newIdSet = new Set(prevChanges.newIssueIds);
   const summaryRows = Object.entries(issuesByEmployee).map(([name, issues]) => {
-    const score = computeEmployeeScore(issues, cycleEndForScoring);
+    const score = computeEmployeeScore(issues, cycleEndForScoring, held);
     const sp = (i: { story_points?: number | string | null }) => Number(i.story_points ?? 0) || 0;
     const spTotal = issues.reduce((s, i) => s + sp(i), 0);
     // SP-done is STRICT: only SP whose issue is truly shipped (Approved for
@@ -406,7 +429,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
       tickets_added: newOnes.length,
       sp_added: newOnes.reduce((s, i) => s + sp(i), 0),
     };
-  }).sort((a, b) => (b.pct ?? -1) - (a.pct ?? -1));
+  }).sort((a, b) => {
+    // "unassigned" always sinks to the bottom (it's a bucket, not a person).
+    if (a.name === "unassigned") return 1;
+    if (b.name === "unassigned") return -1;
+    return (b.pct ?? -1) - (a.pct ?? -1);
+  });
 
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
@@ -612,8 +640,8 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <div className="text-xs uppercase tracking-wider text-emerald-600 mb-2"
-                         title="Ranked by difficulty-weighted progress delivered (volume × how-far × quality) — NOT raw completion %, so one tiny finished ticket can't top the list.">
-                      Top performers</div>
+                         title="Ranked by OUTPUT = difficulty-weighted progress delivered (volume × how-far × quality). This is a contribution measure, not the same as completion %. The big number is output points; the % in brackets is that person's completion rate.">
+                      Top performers <span className="text-slate-400 normal-case tracking-normal">· by output</span></div>
                     {pulse.topPerformers.length === 0 ? (
                       <div className="text-xs text-slate-400 italic">Nobody completed work yet</div>
                     ) : (
@@ -626,7 +654,8 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                               : "bg-amber-50 text-amber-700"
                             }`}>{i + 1}</span>
                             <span className="text-slate-800 font-medium flex-1 truncate">{p.name}</span>
-                            <span className="text-[11px] tabular-nums text-slate-500" title="output = weighted progress delivered">{fmt(p.weightDone)}</span>
+                            <span className="text-[12px] tabular-nums text-slate-800 font-semibold" title="Output = weighted progress delivered (Σ weight × credit). The cycle's main 'who carried it' number.">{fmt(p.weightDone)}</span>
+                            <span className="text-[10px] tabular-nums text-slate-400" title="That person's completion % (how far along their own assigned work is).">({p.pct !== null ? Math.round(p.pct * 100) : "—"}%)</span>
                           </li>
                         ))}
                       </ul>
@@ -910,12 +939,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                     <tbody className="tabular-nums">
                       {[
                         ["Todo / Backlog", "0%", "not started", "text-slate-400"],
-                        ["In Development", "35%", "actively building", "text-slate-600"],
-                        ["Code Review", "60%", "code written, in review", "text-slate-600"],
-                        ["In Review", "70%", "later review", "text-slate-600"],
-                        ["In QA / Ready-Deploy", "80%", "dev work DONE — handoff", "text-emerald-700 font-semibold"],
-                        ["PT Review", "88%", "product testing", "text-slate-600"],
-                        ["Approved for Prod", "95%", "passed all gates", "text-slate-600"],
+                        ["In Development", "30%", "actively building", "text-slate-600"],
+                        ["Code Review", "55%", "code written, in review", "text-slate-600"],
+                        ["In Review", "65%", "later review", "text-slate-600"],
+                        ["In QA / Ready-Deploy", "78%", "dev work DONE — handoff", "text-emerald-700 font-semibold"],
+                        ["PT Review", "86%", "product testing", "text-slate-600"],
+                        ["Approved for Prod", "93%", "passed all gates", "text-slate-600"],
                         ["Released / Done", "100%", "shipped / closed", "text-slate-600"],
                       ].map(([s, c, m, cls]) => (
                         <tr key={s as string} className="border-t border-violet-100">
@@ -927,35 +956,54 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                     </tbody>
                   </table>
                   <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
-                    The last 80%→100% is a <b>quality reserve</b>: released only as QA/PT/Prod confirm
+                    The last 78%→100% is a <b>quality reserve</b>: released only as QA/PT/Prod confirm
                     the work is clean. If QA finds a bug and bounces it back, the status drops — so the
                     credit drops automatically — and a re-completion lands at <b>0.7×</b> (rework).
                   </p>
                 </div>
 
+                {/* ── Bug retention (hold & release) ── */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">🐞 Bugs &amp; bug-retention</h3>
+                  <p className="text-[12px] text-slate-600 leading-relaxed">
+                    Every issue is tagged <b>Bug</b> or <b>Feature</b> (from its Linear label) — shown as a chip
+                    under each Issue&nbsp;ID. A bug is its own issue, linked back to the feature it came from
+                    (<span className="font-mono text-[11px]">🐞 Bug →AB-412</span>).
+                  </p>
+                  <ul className="text-[11px] text-slate-500 mt-2 leading-relaxed list-disc pl-4 space-y-1">
+                    <li><b className="text-violet-700">Hold &amp; release:</b> a feature with an <b>open</b> linked bug
+                      is <b>held at 78%</b> (the <span className="font-mono">🛡 Held</span> chip) until the bug is
+                      fixed — then it releases to its real credit. &ldquo;No full marks until it&apos;s correct.&rdquo;</li>
+                    <li><b>Bug-fix work counts at 0.7×</b> (corrective), so shipping clean first time always
+                      out-scores buggy-then-fixed.</li>
+                    <li>Fixing the bug <b>any day / cycle later</b> restores the feature and adds the fix credit.</li>
+                  </ul>
+                </div>
+
                 {/* ── Worked example ── */}
                 <div>
-                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Worked example — 0 done, still ~73%</h3>
+                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Worked example — 0 done, still ~70%</h3>
                   <p className="text-[12px] text-slate-600 leading-relaxed mb-2">
-                    An engineer with <b>30 issues, none formally &ldquo;Done&rdquo;</b>, but most past the QA line:
+                    An engineer with <b>30 issues, none formally &ldquo;Done&rdquo;</b>, but most past the QA line
+                    (weight 1 each here, for clarity):
                   </p>
                   <table className="w-full text-[12px] tabular-nums">
                     <tbody>
-                      <tr className="border-t border-violet-100"><td className="py-1">6 × Approved for Prod</td><td className="text-right text-slate-500">×0.95</td><td className="text-right font-medium">≈ 8.1</td></tr>
-                      <tr className="border-t border-violet-100"><td className="py-1">6 × PT Review</td><td className="text-right text-slate-500">×0.88</td><td className="text-right font-medium">≈ 5.0</td></tr>
-                      <tr className="border-t border-violet-100"><td className="py-1">9 + 3 × In QA / Ready</td><td className="text-right text-slate-500">×0.80</td><td className="text-right font-medium">≈ 14.8</td></tr>
-                      <tr className="border-t border-violet-100"><td className="py-1">3 × In Development</td><td className="text-right text-slate-500">×0.35</td><td className="text-right font-medium">≈ 1.0</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">6 × Approved for Prod</td><td className="text-right text-slate-500">×0.93</td><td className="text-right font-medium">5.58</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">6 × PT Review</td><td className="text-right text-slate-500">×0.86</td><td className="text-right font-medium">5.16</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">12 × In QA / Ready</td><td className="text-right text-slate-500">×0.78</td><td className="text-right font-medium">9.36</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">3 × In Development</td><td className="text-right text-slate-500">×0.30</td><td className="text-right font-medium">0.90</td></tr>
                       <tr className="border-t border-violet-100"><td className="py-1">3 × Todo</td><td className="text-right text-slate-500">×0.00</td><td className="text-right font-medium">0</td></tr>
                     </tbody>
                     <tfoot>
                       <tr className="border-t-2 border-violet-200 font-semibold">
                         <td className="py-1.5">earned ÷ total weight</td>
-                        <td className="text-right" colSpan={2}>30.9 ÷ 42.2 = <span className="text-amber-700">73%</span></td>
+                        <td className="text-right" colSpan={2}>21.0 ÷ 30 = <span className="text-amber-700">70%</span></td>
                       </tr>
                     </tfoot>
                   </table>
                   <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
-                    Each row&apos;s weight = <code className="text-[10px] bg-stone-100 px-1 rounded">SP × priority</code>
+                    Real rows weight by <code className="text-[10px] bg-stone-100 px-1 rounded">SP × priority</code>
                     {" "}(p0 2.0 / p1 1.5 / p2 1.0 / low 0.7; missing SP → 1). The % is the weighted credit.
                   </p>
                 </div>
@@ -972,6 +1020,17 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                   <span className="text-rose-700 font-semibold">LOW &lt;60%</span>.
                   <b> Team weight</b> is the same formula summed across everyone&apos;s issues.
                   Mid-cycle scores are live previews; finalised on cycle-end day. HR can add grace marks.
+                </div>
+                <div className="bg-white border border-stone-200 rounded-lg p-3">
+                  <b>Three numbers, three questions</b> (they&apos;re different on purpose, not a bug):
+                  <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                    <li><b>Completion %</b> — how far along this person&apos;s own work is. Same number on the
+                      team table and the employee page.</li>
+                    <li><b>Output</b> (Top performers) — difficulty-weighted work delivered (volume × how-far ×
+                      quality). Rewards carrying the most hard work, so it ranks differently from %.</li>
+                    <li><b>Rating /10</b> (employee page) — the % mapped to 0–10, <i>plus</i> a small on-time
+                      bonus. So it can sit slightly above the raw %.</li>
+                  </ul>
                 </div>
                 <div>
                   <b>How we know an issue belongs to this cycle:</b> Linear tells us directly — every
@@ -991,10 +1050,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
               </div>
             )}
 
-            {Object.entries(issuesByEmployee).map(([empName, issues]) => {
+            {Object.entries(issuesByEmployee)
+              .sort(([a], [b]) => (a === "unassigned" ? 1 : b === "unassigned" ? -1 : 0))
+              .map(([empName, issues]) => {
               // Use effective_assigned_at when scoring (reassignment-aware).
               const issuesForScoring = issues.map(it => ({ ...it, assigned_at: it.effective_assigned_at }));
-              const score = computeEmployeeScore(issuesForScoring, cycleEndForScoring);
+              const score = computeEmployeeScore(issuesForScoring, cycleEndForScoring, held);
               const complete = completenessByEmployee[empName];
               const isTruncated = complete?.status === "truncated";
               const reassignedAway = reassignedAwayCount[empName] ?? 0;
@@ -1028,14 +1089,20 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                         {empName.charAt(0).toUpperCase()}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <Link
-                          href={`/employees/${encodeURIComponent(empName)}?cycle=${encodeURIComponent(cycleName)}`}
-                          className="font-medium text-slate-900 truncate hover:text-[#AE00D0] hover:underline"
-                        >
-                          {empName}
-                        </Link>
+                        {empName === "unassigned" ? (
+                          <span className="font-medium text-slate-600 truncate">Unassigned issues</span>
+                        ) : (
+                          <Link
+                            href={`/employees/${encodeURIComponent(empName)}?cycle=${encodeURIComponent(cycleName)}`}
+                            className="font-medium text-slate-900 truncate hover:text-[#AE00D0] hover:underline"
+                          >
+                            {empName}
+                          </Link>
+                        )}
                         <div className="text-[11px] text-slate-500 tabular-nums">
-                          {issues.length} issue{issues.length !== 1 ? "s" : ""} · weight {score.weightDone}/{score.weightTotal} · {pctStr}
+                          {empName === "unassigned"
+                            ? <span className="normal-case not-italic text-slate-500">{issues.length} issue{issues.length !== 1 ? "s" : ""} with no owner in Linear — not counted toward any person. HR / PM can assign these to credit the right engineer.</span>
+                            : <>{issues.length} issue{issues.length !== 1 ? "s" : ""} · weight {score.weightDone}/{score.weightTotal} · {pctStr}</>}
                         </div>
                       </div>
                       {/* Progress bar — desktop only */}
@@ -1142,7 +1209,27 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                           return (
                             <tr key={it.issue_id}
                                 className={`border-t border-stone-100 ${done ? "bg-emerald-50/20" : ""}`}>
-                              <td className="px-3 py-2.5 font-mono text-xs text-slate-600">{it.issue_id}</td>
+                              <td className="px-3 py-2.5 font-mono text-xs text-slate-600 align-top">
+                                {it.issue_id}
+                                <div className="mt-1 flex flex-col gap-0.5 items-start">
+                                  {isBug(it) ? (
+                                    <span title={it.is_bug_of ? `Bug — belongs to ${it.is_bug_of}. Counted at ${REWORK_PENALTY}× (corrective work).` : `Bug (no linked feature in Linear). Counted at ${REWORK_PENALTY}× (corrective work).`}
+                                          className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300 rounded px-1.5 py-0.5 shadow-[0_0_6px_rgba(244,63,94,0.35)]">
+                                      🐞 Bug{it.is_bug_of ? <span className="font-mono font-semibold normal-case">→{it.is_bug_of}</span> : null}
+                                    </span>
+                                  ) : (
+                                    <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide bg-sky-50 text-sky-700 ring-1 ring-inset ring-sky-200 rounded px-1.5 py-0.5">
+                                      {(it.issue_type || "feature")}
+                                    </span>
+                                  )}
+                                  {!isBug(it) && held.has(it.issue_id) && (
+                                    <span title="This feature has an OPEN linked bug, so its credit is HELD at 0.78 (In-QA level) until the bug is fixed — then it releases to full."
+                                          className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-violet-100 text-violet-800 ring-1 ring-inset ring-violet-300 rounded px-1.5 py-0.5 shadow-[0_0_6px_rgba(174,0,208,0.30)]">
+                                      🛡 Held · open bug
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
                               <td className="px-3 py-2.5 text-slate-800 max-w-md" title={it.title ?? ""}>
                                 <div className="truncate">{it.title ?? <span className="text-slate-300">—</span>}</div>
                                 {wasReassigned && (

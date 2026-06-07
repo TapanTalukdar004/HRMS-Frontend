@@ -6,6 +6,7 @@ import {
   getEmployeeStatusCreditTrend,
   getEmployeeRollup,
   getIssuesForEmployeeByCycle,
+  getHeldFeaturesByCycle,
   currentPeriod,
   periodLabel,
   type EmployeeCycleIssue,
@@ -16,7 +17,7 @@ import { BackButton } from "@/components/BackButton";
 import {
   computeWeight, computeExpectedDays, classifyLane, isCompleted,
   hasSpEstimate, computeEmployeeScore, computeCyclePerformance, isDevComplete,
-  statusCredit,
+  statusCredit, isBug, isCorrective, HOLD_CAP, REWORK_PENALTY,
 } from "@/lib/issueScoring";
 
 export const dynamic = "force-dynamic";
@@ -323,6 +324,12 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
     getEmployeeTrendFilled(name),
     getEmployeeStatusCreditTrend(name),
   ]);
+  // Bug-retention: cycle-wide held-feature set (a feature with an open linked
+  // bug is held at HOLD_CAP). Fetched per team in scope so this page's numbers
+  // match the team dashboard exactly. Keyed by cycle_name.
+  const teamsInScope = [...new Set(issuesByCycle.map((c) => c.team).filter(Boolean))] as string[];
+  const heldMaps = await Promise.all(teamsInScope.map((t) => getHeldFeaturesByCycle(t)));
+  const heldByCycle: Record<string, Set<string>> = Object.assign({}, ...heldMaps);
   // Optional cycle filter
   const trend = cycleFilter
     ? fullTrend.filter((r) => r.cycle_name === cycleFilter)
@@ -436,7 +443,8 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                 // Cycle Performance Score — throughput + timeliness BONUS.
                 const cyEnd = c.cycle_end ? c.cycle_end + "T23:59:59Z" : "2099-12-31T23:59:59Z";
                 const cyStart = c.cycle_start ? c.cycle_start + "T00:00:00Z" : null;
-                const perf = computeCyclePerformance(c.issues, cyEnd, cyStart);
+                const heldForCycle = heldByCycle[c.cycle_name] ?? new Set<string>();
+                const perf = computeCyclePerformance(c.issues, cyEnd, cyStart, heldForCycle);
                 const score = { weightDone: perf.weightDone, weightTotal: perf.weightTotal,
                                 classification: perf.classification, pctComplete: perf.throughput };
                 const pctStr = `${Math.round(perf.throughput * 100)}%`;
@@ -567,9 +575,11 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                       </summary>
                       <div className="px-4 pb-4 pt-1">
                         <p className="text-[11px] text-slate-500 mb-2 leading-relaxed">
-                          Each issue earns <b>weight × status-credit</b>. Weight = SP × priority
+                          Each issue earns <b>weight × effective-credit</b>. Weight = SP × priority
                           (p0 2.0 / p1 1.5 / p2 1.0 / low 0.7; missing SP → 1). Credit grows with
-                          status: In QA 78% → Approved 93% → Done 100%. The score is total earned ÷ total weight.
+                          status: In QA 78% → Approved 93% → Done 100%. A <b className="text-violet-700">🛡 held</b> feature
+                          (open linked bug) caps at 78%; a <b className="text-rose-700">🐞 bug</b> counts at {REWORK_PENALTY}×.
+                          Score = total earned ÷ total weight.
                         </p>
                         <div className="overflow-x-auto">
                           <table className="w-full text-[11.5px] tabular-nums">
@@ -586,15 +596,28 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                                 .map(it => {
                                   const cr = statusCredit(it);
                                   const w = computeWeight(it);
-                                  return { it, cr, w, earned: cr === null ? 0 : w * cr };
+                                  // effective credit = same hold + corrective the score uses
+                                  let eff = cr;
+                                  const heldHere = cr !== null && !isBug(it)
+                                    && heldForCycle.has(it.issue_id) && cr > HOLD_CAP;
+                                  if (cr !== null) {
+                                    eff = heldHere ? HOLD_CAP : cr;
+                                    if (isCorrective(it)) eff = eff * REWORK_PENALTY;
+                                  }
+                                  return { it, cr, eff, w, heldHere,
+                                           earned: cr === null ? 0 : w * (eff as number) };
                                 })
                                 .sort((a, b) => b.earned - a.earned)
-                                .map(({ it, cr, w, earned }) => (
+                                .map(({ it, cr, eff, w, heldHere, earned }) => (
                                   <tr key={it.issue_id} className="border-t border-stone-100">
-                                    <td className="py-1 pr-2 font-mono text-[10.5px] text-slate-600">{it.issue_id}</td>
+                                    <td className="py-1 pr-2 font-mono text-[10.5px] text-slate-600">
+                                      {it.issue_id}
+                                      {heldHere && <span title="held — open linked bug" className="ml-1">🛡</span>}
+                                      {isBug(it) && <span title={`bug · ${REWORK_PENALTY}×`} className="ml-1">🐞</span>}
+                                    </td>
                                     <td className="py-1 pr-2 text-slate-600">{cr === null ? "excluded" : it.status}</td>
                                     <td className="py-1 pr-2 text-right text-slate-500">{w}</td>
-                                    <td className="py-1 pr-2 text-right text-slate-500">{cr === null ? "—" : `${Math.round(cr * 100)}%`}</td>
+                                    <td className="py-1 pr-2 text-right text-slate-500">{cr === null ? "—" : `${Math.round((eff as number) * 100)}%`}</td>
                                     <td className="py-1 text-right font-medium text-slate-800">{cr === null ? "—" : earned.toFixed(2)}</td>
                                   </tr>
                                 ))}

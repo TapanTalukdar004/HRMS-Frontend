@@ -98,6 +98,15 @@ export const EXCLUDED_STATUS = new Set(["canceled", "cancelled", "duplicate"]);
 export const UNKNOWN_STATUS_CREDIT = 0.35;
 export const DEV_DONE_CREDIT = 0.78;   // In QA line — developer's hands-on work done
 
+/**
+ * Bug-retention (hold & release) — MUST mirror scoring.py.
+ * A feature/story with an OPEN linked bug is HELD at HOLD_CAP until the bug
+ * clears, then releases. Corrective work (bug, or reopened) is discounted
+ * REWORK_PENALTY so clean-first-time out-scores buggy-then-fixed.
+ */
+export const HOLD_CAP = 0.78;
+export const BUG_RESOLVED_CREDIT = 0.93;   // bug at/above this is "fixed"
+
 function normStatus(raw?: string | null): string {
   let s = (raw ?? "").trim().toLowerCase();
   s = s.replace(/\s*-\s*/g, "-").replace(/\s+/g, " ");
@@ -117,6 +126,33 @@ export function statusCredit(issue: Issue): number | null {
 export function isDevComplete(issue: Issue): boolean {
   const c = statusCredit(issue);
   return c !== null && c >= DEV_DONE_CREDIT;
+}
+
+/** True when the issue is a bug (type field == 'bug' OR a 'Bug' label). */
+export function isBug(issue: Issue): boolean {
+  if ((issue.issue_type ?? "").trim().toLowerCase() === "bug") return true;
+  return (issue.labels ?? []).some(
+    (l) => typeof l === "string" && l.trim().toLowerCase() === "bug",
+  );
+}
+
+/** Corrective work = a bug, OR a reopened issue. Counted at REWORK_PENALTY. */
+export function isCorrective(issue: Issue): boolean {
+  return isBug(issue) || reopenCount(issue) > 0;
+}
+
+/** Feature/story ids that currently have ≥1 OPEN linked bug (credit <
+ *  BUG_RESOLVED_CREDIT). Those features are held at HOLD_CAP until cleared.
+ *  MUST mirror scoring.py:held_feature_ids — pass the WHOLE cycle's issues. */
+export function heldFeatureIds(allIssues: Issue[]): Set<string> {
+  const held = new Set<string>();
+  for (const it of allIssues) {
+    if (!isBug(it)) continue;
+    const cr = statusCredit(it);
+    if (cr === null || cr >= BUG_RESOLVED_CREDIT) continue;
+    if (it.is_bug_of) held.add(String(it.is_bug_of));
+  }
+  return held;
 }
 
 export const HIGH_THRESHOLD = 0.80;
@@ -146,6 +182,9 @@ export type Issue = {
    *  history).  Joined from issue_quality in the query layer; 0 / absent
    *  when there's no rework. */
   reopen_count?: number | null;
+  /** For bug-typed issues: the feature/story this bug belongs to (resolved
+   *  from Linear relations by the v4 exporter). Drives the bug-retention hold. */
+  is_bug_of?: string | null;
 };
 
 export type Lane =
@@ -297,7 +336,9 @@ function scoreFromPct(pct: number | null): number | null {
 export function computeEmployeeScore(
   issues: Issue[],
   cycleEnd: string | Date,
+  heldFeatures?: Set<string>,
 ): EmployeeScore {
+  const held = heldFeatures ?? new Set<string>();
   let weightDone = 0;
   let weightTotal = 0;
   const lanes: Record<Lane, number> = {
@@ -305,9 +346,10 @@ export function computeEmployeeScore(
   };
   const explanation: string[] = [];
 
-  // STATUS-AWARE MODEL (mirrors scoring.py:compute_employee_score).
-  // credited = weight × statusCredit × rework_factor. Lanes still computed
-  // for display/timeliness but no longer gate credit.
+  // STATUS-AWARE MODEL + BUG RETENTION (mirrors scoring.py:compute_employee_score).
+  // credited = weight × effectiveCredit × correctiveFactor, where a feature
+  // with an open linked bug is held at HOLD_CAP and corrective work (bug /
+  // reopened) is discounted REWORK_PENALTY. Lanes still computed for display.
   for (const issue of issues) {
     const w = computeWeight(issue);
     const iid = issue.issue_id || "?";
@@ -329,16 +371,26 @@ export function computeEmployeeScore(
     const lane = classifyLane(issue, cycleEnd);
     if (lane in lanes) lanes[lane] = (lanes[lane] ?? 0) + 1;
 
-    const rework = reopenCount(issue) > 0;
-    const effCredit = credit * (rework ? REWORK_PENALTY : 1);
+    // 1) Quality HOLD: a feature with an open linked bug can't exceed HOLD_CAP.
+    const heldHere = !isBug(issue) && held.has(iid) && credit > HOLD_CAP;
+    let effCredit = heldHere ? HOLD_CAP : credit;
+    // 2) Corrective DISCOUNT: a bug, or a reopened issue, at 0.7×.
+    const corrective = isCorrective(issue);
+    if (corrective) effCredit *= REWORK_PENALTY;
 
     weightTotal += w;
     weightDone += w * effCredit;
 
-    if (rework) {
+    if (heldHere) {
       explanation.push(
-        `${iid}  credit=${credit} × rework ${REWORK_PENALTY} → ${
+        `${iid}  HELD (open bug) credit ${credit}→${HOLD_CAP}${
+          corrective ? ` × ${REWORK_PENALTY}` : ""} → ${
           Math.round(effCredit * 100) / 100} (weight ${w})`,
+      );
+    } else if (corrective) {
+      explanation.push(
+        `${iid}  ${isBug(issue) ? "bug" : "reworked"} credit=${credit} × ${
+          REWORK_PENALTY} → ${Math.round(effCredit * 100) / 100} (weight ${w})`,
       );
     } else if (credit >= DEV_DONE_CREDIT) {
       explanation.push(`${iid}  dev-done credit=${credit} (weight ${w})`);
@@ -402,8 +454,9 @@ export function computeCyclePerformance(
   issues: (Issue & { effective_assigned_at?: string | null })[],
   cycleEnd: string | Date,
   cycleStart: string | Date | null = null,
+  heldFeatures?: Set<string>,
 ): CyclePerformance {
-  const es = computeEmployeeScore(issues, cycleEnd);
+  const es = computeEmployeeScore(issues, cycleEnd, heldFeatures);
   const base = es.score0to10;
 
   const completed = issues.filter(isCompleted);

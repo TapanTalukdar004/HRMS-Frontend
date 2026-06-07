@@ -287,6 +287,9 @@ export type CycleIssue = {
    *  in this cycle.  >0 means QA caught a bug after completion (under
    *  the >24h heuristic).  Drives the rework penalty + quality badges. */
   reopen_count?: number | null;
+  /** For bug-typed issues: the feature/story this bug belongs to (resolved
+   *  from Linear relations by the v4 exporter). Drives the bug-retention hold. */
+  is_bug_of?: string | null;
 };
 
 /** Per-employee completeness flag for one snapshot.
@@ -368,6 +371,7 @@ export async function getIssuesForEmployeeByCycle(
         cycle_name, team, cycle_start, cycle_end,
         issue_id, employee_name, employee_id, title, issue_type,
         priority, story_points, status, labels, assigned_at, completed_at,
+        is_bug_of,
         snap AS snapshot_at
       FROM emp_rows
       ORDER BY cycle_name, issue_id, snap DESC
@@ -393,7 +397,7 @@ export async function getIssuesForEmployeeByCycle(
       '' AS id, ''::text AS cycle_id,
       l.employee_name, l.employee_id::text AS employee_id,
       l.issue_id, l.title, l.issue_type, l.priority, l.story_points,
-      l.status, l.labels,
+      l.status, l.labels, l.is_bug_of,
       l.assigned_at::text, l.completed_at::text,
       f.first_seen_at::text, f.first_priority, f.first_story_points, f.first_status
     FROM latest l
@@ -524,6 +528,43 @@ export async function getCrossCyclePriorAppearance(
 }
 
 
+/** Bug-retention: for each cycle (latest snapshot), the set of feature ids
+ *  that currently have ≥1 OPEN linked bug — so the read-time scorer can hold
+ *  those features at HOLD_CAP. Returns a map keyed by cycle_name.
+ *  "Open" = a bug-typed issue whose status is below Approved-for-Prod (credit
+ *  < 0.93). Kept in SQL with the resolved-status list to avoid a round-trip. */
+export async function getHeldFeaturesByCycle(
+  team: string,
+): Promise<Record<string, Set<string>>> {
+  const rows = await q<{ cycle_name: string; feature_id: string }>(
+    `
+    WITH ranked AS (
+      SELECT pc.cycle_name, cei.is_bug_of, cei.issue_type, cei.status,
+             COALESCE(pc.snapshot_at, pc.received_at) AS snap,
+             MAX(COALESCE(pc.snapshot_at, pc.received_at))
+               OVER (PARTITION BY pc.cycle_name) AS latest_snap
+      FROM cycle_employee_issues cei
+      JOIN performance_cycles pc ON pc.id = cei.cycle_id
+      WHERE pc.team = $1
+    )
+    SELECT cycle_name, is_bug_of AS feature_id
+    FROM ranked
+    WHERE snap = latest_snap
+      AND is_bug_of IS NOT NULL
+      AND lower(coalesce(issue_type, '')) = 'bug'
+      AND lower(coalesce(status, '')) NOT IN
+          ('approved for prod','released to prod','done','completed',
+           'closed','resolved','canceled','cancelled','duplicate')
+    GROUP BY cycle_name, is_bug_of
+    `,
+    [team],
+  );
+  const out: Record<string, Set<string>> = {};
+  for (const r of rows) (out[r.cycle_name] ??= new Set()).add(r.feature_id);
+  return out;
+}
+
+
 export type CycleCrossSnapshotResult = {
   /** Issues grouped by their CURRENT assignee.  Each issue appears
    *  exactly once (under whoever holds it now). */
@@ -560,6 +601,7 @@ export async function getCycleIssuesAcrossSnapshots(
     status: string | null;
     labels: string[] | null;
     parent_issue_id: string | null;
+    is_bug_of: string | null;
     esha_assigned_at: string | null;
     completed_at: string | null;
     latest_snapshot_at: string;
@@ -587,7 +629,7 @@ export async function getCycleIssuesAcrossSnapshots(
     per_assignee_latest AS (
       SELECT DISTINCT ON (issue_id, employee_name)
         issue_id, employee_name, employee_id, title, issue_type,
-        priority, story_points, status, labels, parent_issue_id,
+        priority, story_points, status, labels, parent_issue_id, is_bug_of,
         assigned_at, completed_at, snapshot_at, cycle_id
       FROM all_rows
       ORDER BY issue_id, employee_name, snapshot_at DESC
@@ -615,7 +657,7 @@ export async function getCycleIssuesAcrossSnapshots(
       SELECT
         l.issue_id, l.employee_name, l.employee_id::text AS employee_id,
         l.title, l.issue_type, l.priority, l.story_points,
-        l.status, l.labels, l.parent_issue_id,
+        l.status, l.labels, l.parent_issue_id, l.is_bug_of,
         l.assigned_at::text AS esha_assigned_at,
         l.completed_at::text AS completed_at,
         l.snapshot_at::text  AS latest_snapshot_at,
@@ -680,6 +722,7 @@ export async function getCycleIssuesAcrossSnapshots(
       completed_at: cur.completed_at,
       snapshot_at: cur.latest_snapshot_at,
       parent_issue_id: cur.parent_issue_id,
+      is_bug_of: cur.is_bug_of,
       reopen_count: cur.reopen_count ?? 0,
       effective_assigned_at: effectiveAssigned,
       reassigned_from: prev ? prev.employee_name : null,
