@@ -29,7 +29,7 @@ export type GI = {
 };
 
 type PlacedNode = { gi: GI; x: number; y: number; held: boolean };
-type Cluster = { parent: PlacedNode; children: PlacedNode[] };
+type Edge = { key: string; x1: number; y1: number; x2: number; y2: number };
 
 const NODE_W = 230, NODE_H = 56, COL_GAP = 90, ROW_GAP = 14, CLUSTER_GAP = 26, PAD = 40;
 
@@ -37,47 +37,75 @@ function parentLink(i: GI): string | null {
   return i.is_bug_of ?? i.parent_issue_id ?? null;
 }
 
+/**
+ * Each issue is rendered EXACTLY ONCE (unique React keys):
+ *   • a "head" if it has children (heads its own cluster, left column);
+ *   • otherwise a "leaf" under its single parent (right column).
+ * An issue that is both a parent AND someone's child (mutual "related" links,
+ * sub-issue chains) is rendered only as a head; the other parent draws a
+ * connector to it. Edges are de-duplicated on the unordered id pair so a
+ * mutual link shows as a single line.
+ */
 function buildLayout(issues: GI[]) {
   const byId = new Map(issues.map((i) => [i.issue_id, i]));
-  // group children by their parent id
   const childrenByParent = new Map<string, GI[]>();
   for (const i of issues) {
     const p = parentLink(i);
     if (p) (childrenByParent.get(p) ?? childrenByParent.set(p, []).get(p)!).push(i);
   }
-  const isOpen = (i: GI) => {
-    const c = statusCredit(i);
-    return c !== null && c < 0.93;
-  };
-  const clusters: Cluster[] = [];
-  let y = PAD;
-  // stable order: parents with most children first
-  const parentIds = [...childrenByParent.keys()].sort(
-    (a, b) => (childrenByParent.get(b)!.length) - (childrenByParent.get(a)!.length),
+  const parentIds = new Set(childrenByParent.keys());
+  const isOpen = (i: GI) => { const c = statusCredit(i); return c !== null && c < 0.93; };
+
+  const placedById = new Map<string, PlacedNode>();
+  const headIds = [...parentIds].sort(
+    (a, b) => childrenByParent.get(b)!.length - childrenByParent.get(a)!.length,
   );
-  for (const pid of parentIds) {
+  let y = PAD;
+  for (const pid of headIds) {
     const kids = childrenByParent.get(pid)!;
-    // synthetic parent node if the feature isn't in this cycle's set
+    // leaves = kids that are not themselves heads (those are placed in their own row)
+    const leafKids = kids.filter((k) => !parentIds.has(k.issue_id));
     const pgi: GI = byId.get(pid) ?? {
-      issue_id: pid, title: "(feature outside this cycle)", issue_type: "feature",
+      issue_id: pid, title: "(issue outside this cycle)", issue_type: "feature",
       status: null, story_points: null, priority: null, employee_name: null,
       is_bug_of: null, parent_issue_id: null, issue_url: null,
     };
     const held = kids.some((k) => isBug(k) && isOpen(k));
-    const blockH = Math.max(NODE_H, kids.length * (NODE_H + ROW_GAP) - ROW_GAP);
-    const parent: PlacedNode = { gi: pgi, x: PAD, y: y + blockH / 2 - NODE_H / 2, held };
-    const children: PlacedNode[] = kids.map((k, idx) => ({
-      gi: k, held: false, x: PAD + NODE_W + COL_GAP, y: y + idx * (NODE_H + ROW_GAP),
-    }));
-    clusters.push({ parent, children });
+    const blockH = Math.max(NODE_H, leafKids.length * (NODE_H + ROW_GAP) - ROW_GAP);
+    if (!placedById.has(pid)) {
+      placedById.set(pid, { gi: pgi, x: PAD, y: y + blockH / 2 - NODE_H / 2, held });
+    }
+    leafKids.forEach((k, idx) => {
+      if (!placedById.has(k.issue_id)) {
+        placedById.set(k.issue_id, {
+          gi: k, held: false, x: PAD + NODE_W + COL_GAP, y: y + idx * (NODE_H + ROW_GAP),
+        });
+      }
+    });
     y += blockH + CLUSTER_GAP;
   }
+
+  // edges between canonical placements, de-duplicated on the unordered pair
+  const seen = new Set<string>();
+  const edges: Edge[] = [];
+  for (const [pid, kids] of childrenByParent) {
+    const pn = placedById.get(pid);
+    if (!pn) continue;
+    for (const k of kids) {
+      const cn = placedById.get(k.issue_id);
+      if (!cn || cn === pn) continue;
+      const key = [pid, k.issue_id].sort().join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({ key, x1: pn.x + NODE_W, y1: pn.y + NODE_H / 2, x2: cn.x, y2: cn.y + NODE_H / 2 });
+    }
+  }
+
   const width = PAD * 2 + NODE_W * 2 + COL_GAP;
   const height = y + PAD;
-  const linkedIds = new Set<string>();
-  for (const c of clusters) { linkedIds.add(c.parent.gi.issue_id); c.children.forEach((k) => linkedIds.add(k.gi.issue_id)); }
-  const standalone = issues.filter((i) => !linkedIds.has(i.issue_id) && !parentLink(i));
-  return { clusters, width, height, standalone };
+  const nodes = [...placedById.values()];
+  const standalone = issues.filter((i) => !placedById.has(i.issue_id));
+  return { nodes, edges, width, height, standalone };
 }
 
 function creditPct(i: GI): number {
@@ -118,7 +146,7 @@ function NodeBox({ n, onClick, selected }: { n: PlacedNode; onClick: () => void;
 }
 
 export function IssueMap({ issues }: { issues: GI[] }) {
-  const { clusters, width, height, standalone } = useMemo(() => buildLayout(issues), [issues]);
+  const { nodes, edges, width, height, standalone } = useMemo(() => buildLayout(issues), [issues]);
   const [t, setT] = useState({ x: 0, y: 0, k: 0.9 });
   const [sel, setSel] = useState<GI | null>(null);
   const drag = useRef<{ px: number; py: number; ox: number; oy: number } | null>(null);
@@ -154,29 +182,25 @@ export function IssueMap({ issues }: { issues: GI[] }) {
         onWheel={onWheel} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}
         className="relative h-[600px] overflow-hidden rounded-xl border border-stone-200 bg-[radial-gradient(circle,#ece8f3_1px,transparent_1px)] [background-size:22px_22px] cursor-grab active:cursor-grabbing select-none"
       >
-        {clusters.length === 0 ? (
+        {nodes.length === 0 ? (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-400">
-            No linked bug clusters in this cycle yet — links appear here as bugs are related to features in Linear.
+            No linked clusters in this cycle yet — links appear here as issues are related in Linear.
           </div>
         ) : (
           <div style={{ transform: `translate(${t.x}px,${t.y}px) scale(${t.k})`, transformOrigin: "0 0", width, height }} className="absolute">
             {/* connectors */}
             <svg width={width} height={height} className="absolute top-0 left-0 pointer-events-none">
-              {clusters.flatMap((c) =>
-                c.children.map((k) => {
-                  const x1 = c.parent.x + NODE_W, y1 = c.parent.y + NODE_H / 2;
-                  const x2 = k.x, y2 = k.y + NODE_H / 2;
-                  const mx = (x1 + x2) / 2;
-                  return (
-                    <path key={`${c.parent.gi.issue_id}-${k.gi.issue_id}`}
-                          d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`}
-                          fill="none" stroke="#d6cfe6" strokeWidth={1.5} />
-                  );
-                }),
-              )}
+              {edges.map((e) => {
+                const mx = (e.x1 + e.x2) / 2;
+                return (
+                  <path key={e.key}
+                        d={`M${e.x1},${e.y1} C${mx},${e.y1} ${mx},${e.y2} ${e.x2},${e.y2}`}
+                        fill="none" stroke="#d6cfe6" strokeWidth={1.5} />
+                );
+              })}
             </svg>
-            {/* nodes */}
-            {clusters.flatMap((c) => [c.parent, ...c.children]).map((n) => (
+            {/* nodes — each issue exactly once */}
+            {nodes.map((n) => (
               <NodeBox key={n.gi.issue_id} n={n} selected={sel?.issue_id === n.gi.issue_id} onClick={() => setSel(n.gi)} />
             ))}
           </div>
