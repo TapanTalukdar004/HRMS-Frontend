@@ -9,6 +9,25 @@
  */
 import { q } from "./db";
 
+// ─── Source preference (Esha → Linear migration) ───────────────────────────
+//
+// We now ingest directly from Linear (source LIKE 'linear%'), which is
+// complete + status-accurate.  The legacy Esha snapshots stay in the DB
+// for history but are HIDDEN whenever a cycle has Linear data.
+//
+// This SQL fragment, dropped into a WHERE clause, keeps only the
+// preferred source for a (team, cycle_name): Linear rows if any exist,
+// otherwise the Esha rows.  It relies on positional params $1 = team and
+// $2 = cycle_name being present in the host query.  `source` resolves
+// unambiguously (only performance_cycles has that column).
+const PREFER_LINEAR_SRC = `AND (
+  source LIKE 'linear%'
+  OR NOT EXISTS (
+    SELECT 1 FROM performance_cycles _pl
+    WHERE _pl.team = $1 AND _pl.cycle_name = $2 AND _pl.source LIKE 'linear%'
+  )
+)`;
+
 // ─── Types ────────────────────────────────────────────────────────────────
 
 export type TeamCard = {
@@ -235,6 +254,7 @@ export async function listSnapshotsForCycle(team: string, cycleName: string): Pr
       NULLIF(parsed_payload::jsonb ->> 'days_left', '')::int AS days_left
     FROM performance_cycles
     WHERE team = $1 AND cycle_name = $2
+    ${PREFER_LINEAR_SRC}
     ORDER BY COALESCE(snapshot_at, received_at) ASC
   `, [team, cycleName]);
 }
@@ -259,6 +279,14 @@ export type CycleIssue = {
   assigned_at: string | null;
   completed_at: string | null;
   snapshot_at: string;
+  /** Linear parent.identifier (e.g. "AB-432") for child issues, or null
+   *  for top-level.  Populated from cycle_employee_issues.parent_issue_id
+   *  once Esha starts sending the field. */
+  parent_issue_id?: string | null;
+  /** Count of `reopened` events emitted by the verifier for this issue
+   *  in this cycle.  >0 means QA caught a bug after completion (under
+   *  the >24h heuristic).  Drives the rework penalty + quality badges. */
+  reopen_count?: number | null;
 };
 
 /** Per-employee completeness flag for one snapshot.
@@ -464,6 +492,13 @@ export async function getCrossCyclePriorAppearance(
       FROM cycle_employee_issues cei
       JOIN performance_cycles pc ON pc.id = cei.cycle_id
       WHERE pc.team = $1 AND pc.cycle_name = $2
+        AND (
+          pc.source LIKE 'linear%'
+          OR NOT EXISTS (
+            SELECT 1 FROM performance_cycles _pl
+            WHERE _pl.team = $1 AND _pl.cycle_name = $2 AND _pl.source LIKE 'linear%'
+          )
+        )
     ),
     prior AS (
       SELECT DISTINCT ON (cei.issue_id)
@@ -524,12 +559,14 @@ export async function getCycleIssuesAcrossSnapshots(
     story_points: number | null;
     status: string | null;
     labels: string[] | null;
+    parent_issue_id: string | null;
     esha_assigned_at: string | null;
     completed_at: string | null;
     latest_snapshot_at: string;
     first_seen_at: string;            // when THIS assignee first held this issue
     cycle_id: string;
     assignee_rank: number;            // 1 = current, 2 = previous, 3 = older
+    reopen_count: number;             // from issue_quality view
   }>(
     `
     WITH cycle_snapshots AS (
@@ -537,6 +574,7 @@ export async function getCycleIssuesAcrossSnapshots(
       FROM performance_cycles
       WHERE team = $1 AND cycle_name = $2
         AND COALESCE(snapshot_at, received_at) <= $3::timestamptz
+        ${PREFER_LINEAR_SRC}
     ),
     all_rows AS (
       SELECT cei.*
@@ -549,8 +587,8 @@ export async function getCycleIssuesAcrossSnapshots(
     per_assignee_latest AS (
       SELECT DISTINCT ON (issue_id, employee_name)
         issue_id, employee_name, employee_id, title, issue_type,
-        priority, story_points, status, labels, assigned_at,
-        completed_at, snapshot_at, cycle_id
+        priority, story_points, status, labels, parent_issue_id,
+        assigned_at, completed_at, snapshot_at, cycle_id
       FROM all_rows
       ORDER BY issue_id, employee_name, snapshot_at DESC
     ),
@@ -560,13 +598,24 @@ export async function getCycleIssuesAcrossSnapshots(
       FROM all_rows
       GROUP BY issue_id, employee_name
     ),
+    -- Total reopens this issue has accumulated ACROSS this cycle's
+    -- snapshots (sum across snapshot rows so date-rewind still shows
+    -- the quality history that landed on/before the chosen date).
+    quality_by_issue AS (
+      SELECT
+        iq.issue_id,
+        SUM(iq.reopen_count)::int AS reopen_count
+      FROM issue_quality iq
+      JOIN cycle_snapshots cs ON cs.id = iq.cycle_id
+      GROUP BY iq.issue_id
+    ),
     -- Rank assignees within an issue by recency of LAST appearance.
     -- Rank 1 = current holder, 2 = previous, etc.
     ranked AS (
       SELECT
         l.issue_id, l.employee_name, l.employee_id::text AS employee_id,
         l.title, l.issue_type, l.priority, l.story_points,
-        l.status, l.labels,
+        l.status, l.labels, l.parent_issue_id,
         l.assigned_at::text AS esha_assigned_at,
         l.completed_at::text AS completed_at,
         l.snapshot_at::text  AS latest_snapshot_at,
@@ -574,10 +623,12 @@ export async function getCycleIssuesAcrossSnapshots(
         l.cycle_id,
         ROW_NUMBER() OVER (
           PARTITION BY l.issue_id ORDER BY l.snapshot_at DESC
-        )::int AS assignee_rank
+        )::int AS assignee_rank,
+        COALESCE(qbi.reopen_count, 0)::int AS reopen_count
       FROM per_assignee_latest l
       JOIN per_assignee_first f
         ON f.issue_id = l.issue_id AND f.employee_name = l.employee_name
+      LEFT JOIN quality_by_issue qbi ON qbi.issue_id = l.issue_id
     )
     SELECT * FROM ranked
     ORDER BY issue_id, assignee_rank
@@ -628,6 +679,8 @@ export async function getCycleIssuesAcrossSnapshots(
       assigned_at: cur.esha_assigned_at,
       completed_at: cur.completed_at,
       snapshot_at: cur.latest_snapshot_at,
+      parent_issue_id: cur.parent_issue_id,
+      reopen_count: cur.reopen_count ?? 0,
       effective_assigned_at: effectiveAssigned,
       reassigned_from: prev ? prev.employee_name : null,
       reassigned_at:   prev ? cur.first_seen_at  : null,
@@ -661,16 +714,27 @@ export async function getCycleIssuesAcrossSnapshots(
 }
 
 
-/** For the SELECTED snapshot date, return how each issue differs from
- *  the snapshot immediately BEFORE it.  Drives the "what changed since
+/** For the SELECTED snapshot date, return how the cycle differs from the
+ *  snapshot immediately BEFORE it.  Drives the "what changed since
  *  previous snapshot" card + the per-row "↑ from X" indicators.
  *
- *  "As-of" semantics — both sides are computed relative to a date:
- *    • current  = each issue's latest state on/before `asOfSnapshotAt`
- *    • previous = each issue's latest state on/before the snapshot that
- *                 comes immediately before `asOfSnapshotAt`
- *  So selecting May 26 diffs May 26 vs May 25; selecting May 27 diffs
- *  May 27 vs May 26.  Only changed issues are returned.
+ *  Scoping: both sides are computed STRICTLY WITHIN this (team, cycle_name)
+ *  — cur/prv pull only from snapshots in the page's own cycle, so an
+ *  issue that's no longer in the cycle (descoped / reassigned away)
+ *  shows up as a true "dropped" — not silently "unchanged" because the
+ *  most recent global appearance happens to be from a different cycle.
+ *
+ *  Three buckets returned together so callers can render one card:
+ *    • changes        — issues present in both snapshots, with at least
+ *                       one of (priority / SP / status / assignee) different
+ *    • newIssueIds    — issues present in cur but absent from prv (added today)
+ *    • droppedIssueIds — issues present in prv but absent from cur (descoped /
+ *                       reassigned to someone outside this cycle / silent drop)
+ *
+ *  `prevSnapshotAt` is the boundary date.  It's null when the SELECTED
+ *  snapshot is the FIRST of the cycle (Day 1) — the UI can use this to
+ *  display "no previous snapshot to compare against yet" instead of the
+ *  diff card.
  */
 export type PreviousIssueState = {
   issue_id: string;
@@ -681,51 +745,102 @@ export type PreviousIssueState = {
   prev_snapshot_at: string;   // the boundary date the "previous" state is as-of
 };
 
+export type CyclePreviousChanges = {
+  changes: Record<string, PreviousIssueState>;
+  newIssueIds: string[];
+  droppedIssueIds: string[];
+  prevSnapshotAt: string | null;   // null when there's no earlier snap in this cycle
+};
+
 export async function getCyclePreviousSnapshotChanges(
   team: string,
   cycleName: string,
   asOfSnapshotAt: string,
-): Promise<Record<string, PreviousIssueState>> {
-  const rows = await q<PreviousIssueState>(
+): Promise<CyclePreviousChanges> {
+  // First: resolve cycle_ids in this (team, cycle_name) and the prev-boundary
+  // snapshot.  Doing it in one round-trip keeps the page fast.
+  const meta = await q<{
+    sel_cycle_ids: string[];
+    prev_cycle_ids: string[] | null;
+    prev_snap: string | null;
+  }>(
     `
-    WITH cycle_snapshots AS (
+    WITH cs AS (
       SELECT id, COALESCE(snapshot_at, received_at) AS snap
       FROM performance_cycles
       WHERE team = $1 AND cycle_name = $2
+        ${PREFER_LINEAR_SRC}
     ),
     sel AS (SELECT $3::timestamptz AS snap),
-    -- The boundary for "previous": the latest snapshot strictly before
-    -- the selected one.  NULL when the selected snapshot is the first.
-    prev_boundary AS (
-      SELECT MAX(snap) AS snap
-      FROM cycle_snapshots
-      WHERE snap < (SELECT snap FROM sel)
+    sel_cycles AS (
+      SELECT id FROM cs WHERE snap <= (SELECT snap FROM sel)
     ),
-    -- Each issue's state AS-OF the selected date.
-    cur AS (
+    prev_boundary AS (
+      SELECT MAX(snap) AS snap FROM cs WHERE snap < (SELECT snap FROM sel)
+    ),
+    prev_cycles AS (
+      SELECT id FROM cs WHERE snap <= (SELECT snap FROM prev_boundary)
+    )
+    SELECT
+      ARRAY(SELECT id FROM sel_cycles)                    AS sel_cycle_ids,
+      NULLIF(ARRAY(SELECT id FROM prev_cycles), '{}')     AS prev_cycle_ids,
+      (SELECT snap FROM prev_boundary)::text              AS prev_snap
+    `,
+    [team, cycleName, asOfSnapshotAt],
+  );
+
+  const { sel_cycle_ids, prev_cycle_ids, prev_snap } = meta[0] ?? {
+    sel_cycle_ids: [],
+    prev_cycle_ids: null,
+    prev_snap: null,
+  };
+
+  // Day 1 of a brand new cycle has no prev snapshot — return empty
+  // buckets so the UI can show a "Day 1 — nothing to diff yet" message.
+  if (!prev_cycle_ids || prev_cycle_ids.length === 0 || !prev_snap) {
+    return {
+      changes: {},
+      newIssueIds: [],
+      droppedIssueIds: [],
+      prevSnapshotAt: null,
+    };
+  }
+
+  // Second query: build cur + prv strictly within this cycle, then
+  // compute the three buckets (changed / new / dropped).
+  const rows = await q<{
+    issue_id: string;
+    bucket: "changed" | "new" | "dropped";
+    prev_priority: string | null;
+    prev_story_points: number | null;
+    prev_status: string | null;
+    prev_employee_name: string | null;
+  }>(
+    `
+    WITH cur AS (
       SELECT DISTINCT ON (cei.issue_id)
         cei.issue_id, cei.employee_name, cei.priority,
-        cei.story_points, cei.status
+        cei.story_points, cei.status, cei.snapshot_at
       FROM cycle_employee_issues cei
-      WHERE cei.snapshot_at <= (SELECT snap FROM sel)
+      WHERE cei.cycle_id = ANY($1::varchar[])
       ORDER BY cei.issue_id, cei.snapshot_at DESC
     ),
-    -- Each issue's state AS-OF the previous-snapshot boundary.
     prv AS (
       SELECT DISTINCT ON (cei.issue_id)
         cei.issue_id, cei.employee_name, cei.priority,
-        cei.story_points, cei.status
+        cei.story_points, cei.status, cei.snapshot_at
       FROM cycle_employee_issues cei
-      WHERE cei.snapshot_at <= (SELECT snap FROM prev_boundary)
+      WHERE cei.cycle_id = ANY($2::varchar[])
       ORDER BY cei.issue_id, cei.snapshot_at DESC
     )
+    -- Changed: in BOTH snapshots, with at least one field different.
     SELECT
       cur.issue_id,
-      prv.priority           AS prev_priority,
-      prv.story_points       AS prev_story_points,
-      prv.status             AS prev_status,
-      prv.employee_name      AS prev_employee_name,
-      (SELECT snap FROM prev_boundary)::text AS prev_snapshot_at
+      'changed'::text AS bucket,
+      prv.priority         AS prev_priority,
+      prv.story_points     AS prev_story_points,
+      prv.status           AS prev_status,
+      prv.employee_name    AS prev_employee_name
     FROM cur
     JOIN prv ON prv.issue_id = cur.issue_id
     WHERE
@@ -733,12 +848,56 @@ export async function getCyclePreviousSnapshotChanges(
       OR COALESCE(cur.story_points::text, '')       IS DISTINCT FROM COALESCE(prv.story_points::text, '')
       OR COALESCE(cur.status, '')                   IS DISTINCT FROM COALESCE(prv.status, '')
       OR cur.employee_name                          IS DISTINCT FROM prv.employee_name
+
+    UNION ALL
+
+    -- Added: in cur but not in prv.
+    SELECT
+      cur.issue_id,
+      'new'::text,
+      NULL, NULL, NULL, NULL
+    FROM cur
+    WHERE cur.issue_id NOT IN (SELECT issue_id FROM prv)
+
+    UNION ALL
+
+    -- Dropped: in prv but not in cur.
+    SELECT
+      prv.issue_id,
+      'dropped'::text,
+      prv.priority, prv.story_points, prv.status, prv.employee_name
+    FROM prv
+    WHERE prv.issue_id NOT IN (SELECT issue_id FROM cur)
     `,
-    [team, cycleName, asOfSnapshotAt],
+    [sel_cycle_ids, prev_cycle_ids],
   );
-  const byId: Record<string, PreviousIssueState> = {};
-  for (const r of rows) byId[r.issue_id] = r;
-  return byId;
+
+  const changes: Record<string, PreviousIssueState> = {};
+  const newIssueIds: string[] = [];
+  const droppedIssueIds: string[] = [];
+  for (const r of rows) {
+    if (r.bucket === "changed") {
+      changes[r.issue_id] = {
+        issue_id: r.issue_id,
+        prev_priority: r.prev_priority,
+        prev_story_points: r.prev_story_points,
+        prev_status: r.prev_status,
+        prev_employee_name: r.prev_employee_name ?? "",
+        prev_snapshot_at: prev_snap,
+      };
+    } else if (r.bucket === "new") {
+      newIssueIds.push(r.issue_id);
+    } else {
+      droppedIssueIds.push(r.issue_id);
+    }
+  }
+
+  return {
+    changes,
+    newIssueIds,
+    droppedIssueIds,
+    prevSnapshotAt: prev_snap,
+  };
 }
 
 
@@ -1776,5 +1935,50 @@ export async function getEmployeeEventStats(
      GROUP BY employee_name
      ORDER BY completed DESC, reassigned_in DESC`,
     [startISO, endISO],
+  );
+}
+
+// ─── Status-credit trend (per snapshot) ─────────────────────────────────────
+//
+// Per-snapshot per-issue rows for one employee, source-preferred (Linear
+// rows win for any cycle that has them; Esha rows used only for cycles
+// without Linear data).  The employee page groups these by snapshot date
+// and runs computeEmployeeScore() per group to plot the REAL status-credit
+// %, instead of the old tickets_pct that reads the void aggregate table.
+//
+// This is also the foundation for the per-day credit-delta metric.
+export type EmployeeCreditTrendRow = {
+  snapshot_at: string;
+  cycle_name: string;
+  issue_id: string;
+  status: string | null;
+  story_points: number | null;
+  priority: string | null;
+  labels: string[] | null;
+};
+
+export async function getEmployeeStatusCreditTrend(
+  employeeName: string,
+): Promise<EmployeeCreditTrendRow[]> {
+  return await q<EmployeeCreditTrendRow>(
+    `
+    SELECT
+      COALESCE(pc.snapshot_at, pc.received_at)::text AS snapshot_at,
+      pc.cycle_name,
+      cei.issue_id, cei.status, cei.story_points, cei.priority, cei.labels
+    FROM cycle_employee_issues cei
+    JOIN performance_cycles pc ON pc.id = cei.cycle_id
+    WHERE LOWER(cei.employee_name) = LOWER($1)
+      AND (
+        pc.source LIKE 'linear%'
+        OR NOT EXISTS (
+          SELECT 1 FROM performance_cycles _pl
+          WHERE _pl.team = pc.team AND _pl.cycle_name = pc.cycle_name
+            AND _pl.source LIKE 'linear%'
+        )
+      )
+    ORDER BY COALESCE(pc.snapshot_at, pc.received_at) ASC
+    `,
+    [employeeName],
   );
 }

@@ -64,7 +64,7 @@ export function EmployeeTrendChart({ data }: { data: EmployeeSnapshotPoint[] }) 
           <Line
             type="monotone"
             dataKey="tickets_pct"
-            name="Tickets %"
+            name="Completion %"
             stroke="#AE00D0"
             strokeWidth={2}
             dot={{ r: 4, fill: "#AE00D0" }}
@@ -73,7 +73,7 @@ export function EmployeeTrendChart({ data }: { data: EmployeeSnapshotPoint[] }) 
           <Line
             type="monotone"
             dataKey="sp_pct"
-            name="Story points %"
+            name="Dev-done %"
             stroke="#7B5AFF"
             strokeWidth={2}
             strokeDasharray="4 3"

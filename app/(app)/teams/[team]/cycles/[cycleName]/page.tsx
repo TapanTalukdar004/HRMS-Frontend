@@ -2,7 +2,6 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   listSnapshotsForCycle,
-  getSnapshotEmployeesWithDelta,
   getCycleIssuesByEmployee,
   getCycleIssuesAcrossSnapshots,
   getCyclePreviousSnapshotChanges,
@@ -18,7 +17,12 @@ import {
   computeExpectedDays,
   classifyLane,
   isCompleted,
+  isDevComplete,
+  statusCredit,
   hasSpEstimate,
+  qualityState,
+  reopenCount,
+  REWORK_PENALTY,
   type Lane,
 } from "@/lib/issueScoring";
 
@@ -40,6 +44,73 @@ export async function generateMetadata({ params }: Props) {
 function pct(done: number | null, total: number | null): string {
   if (!total || total === 0) return "—";
   return `${Math.round(((done ?? 0) / total) * 100)}%`;
+}
+
+/** Compact number: integer as-is, else one decimal. Coerces defensively
+ *  because pg returns NUMERIC columns as strings. Module-scope so both
+ *  the Team Pulse block and the summary table can use it. */
+function fmtNum(n: number | string | null | undefined): string {
+  const x = Number(n) || 0;
+  return Number.isInteger(x) ? `${x}` : x.toFixed(1);
+}
+
+/** A column header that reveals its full meaning on hover.  The dotted
+ *  underline + help cursor signal "hover me" to non-technical readers. */
+function Hdr({ tip, children }: { tip: string; children: React.ReactNode }) {
+  return (
+    <span
+      title={tip}
+      className="cursor-help border-b border-dotted border-slate-400/70 hover:text-slate-700"
+    >
+      {children}
+    </span>
+  );
+}
+
+/** Coarse pipeline bucket for an issue, from its status credit.
+ *  not_started (0) · building (<0.80) · in_qa (0.80–0.94) · done (≥0.95). */
+type StageKey = "not_started" | "building" | "in_qa" | "done";
+function stageBucket(it: import("@/lib/queries").CycleIssue): StageKey | null {
+  const c = statusCredit(it);
+  if (c === null) return null;          // excluded (canceled/duplicate)
+  if (c === 0) return "not_started";
+  if (c < 0.80) return "building";
+  if (c < 0.95) return "in_qa";
+  return "done";
+}
+
+const STAGE_META: Record<StageKey, { label: string; color: string }> = {
+  not_started: { label: "Not started", color: "#cbd5e1" }, // slate-300
+  building:    { label: "Building / review", color: "#60a5fa" }, // blue-400
+  in_qa:       { label: "In QA / testing", color: "#f59e0b" }, // amber-500
+  done:        { label: "Approved / shipped", color: "#10b981" }, // emerald-500
+};
+
+/** A compact stacked bar showing how a person's issues split across the
+ *  pipeline — so "24 of 30" is no longer mistaken for "24 completed".
+ *  Hover shows exact counts. */
+function StageBar({ stages, total }: { stages: Record<StageKey, number>; total: number }) {
+  const order: StageKey[] = ["done", "in_qa", "building", "not_started"];
+  const tip = order
+    .filter((k) => stages[k] > 0)
+    .map((k) => `${stages[k]} ${STAGE_META[k].label.toLowerCase()}`)
+    .join(" · ");
+  return (
+    <div className="flex items-center gap-2" title={tip || "no issues"}>
+      <div className="flex h-2.5 w-28 rounded-full overflow-hidden bg-stone-100 flex-none">
+        {order.map((k) =>
+          stages[k] > 0 ? (
+            <div key={k} style={{ width: `${(stages[k] / total) * 100}%`, background: STAGE_META[k].color }} />
+          ) : null,
+        )}
+      </div>
+      <span className="text-[11px] tabular-nums text-slate-500 flex-none">
+        <span className="text-emerald-700 font-semibold">{stages.done}</span>
+        <span className="text-amber-600"> +{stages.in_qa}</span>
+        <span className="text-slate-400"> /{total}</span>
+      </span>
+    </div>
+  );
 }
 
 function classBadge(c: string | null) {
@@ -143,9 +214,10 @@ function computeTeamPulse(
   cycleEnd: string | Date,
 ) {
   let totalWeight = 0;
-  let doneWeight = 0;
+  let doneWeight = 0;          // status-credit-weighted (Σ weight × credit)
   let totalIssues = 0;
-  let doneIssues = 0;
+  let doneIssues = 0;          // formally Done (shipped/closed)
+  let devCompleteIssues = 0;   // past the QA handoff line (dev work finished)
   let nMissingSp = 0;          // data-quality counter
   const lanes: Record<Lane, number> = {
     normal: 0, tight: 0, late_dump: 0, removed: 0, blocked_cancelled: 0,
@@ -174,28 +246,45 @@ function computeTeamPulse(
       const w = computeWeight(it);
       totalIssues += 1;
       if (!hasSpEstimate(it)) nMissingSp += 1;
-      const isDone = isCompleted(it);
-      if (lane === "removed" || lane === "late_dump") continue;
+
+      const credit = statusCredit(it);            // 0..1, null = excluded
+      if (credit === null) continue;              // canceled/duplicate — drop
+      const isDone = isCompleted(it);             // formally Done
+      const devDone = isDevComplete(it);          // past QA handoff
+      if (isDone) doneIssues += 1;
+      if (devDone) devCompleteIssues += 1;
+
+      // STATUS-AWARE: total = all non-excluded; done = credit-weighted.
       totalWeight += w;
-      if (isDone) {
-        doneWeight += w;
-        doneIssues += 1;
-      }
+      doneWeight += w * credit;
+
       const pri = (it.priority || "other").toLowerCase();
       const bucket = pri === "p0" || pri === "p1" || pri === "p2" || pri === "low" ? pri : "other";
       priorityBuckets[bucket].totalWeight += w;
-      if (isDone) priorityBuckets[bucket].done += 1;
+      // "done" per priority now means dev-complete (past QA) — the
+      // meaningful "finished" number, not just formally-closed.
+      if (devDone) priorityBuckets[bucket].done += 1;
       else priorityBuckets[bucket].open += 1;
     }
   }
 
-  const sorted = [...perEmployee].sort((a, b) => (b.pct ?? -1) - (a.pct ?? -1));
-  const topPerformers = sorted.filter(p => p.pct !== null && p.pct > 0).slice(0, 3);
-  const watchList = sorted.filter(p => p.classification === "low" || p.pct === 0).slice(-3).reverse();
+  // LEADERS rank by OUTPUT = weightDone (Σ weight × credit × rework) — i.e.
+  // difficulty-weighted progress delivered, accounting for quality. This is
+  // the "who carried the cycle" measure, NOT raw completion % (which would
+  // crown someone with one tiny finished ticket).
+  const byOutput = [...perEmployee].sort((a, b) => b.weightDone - a.weightDone);
+  const topPerformers = byOutput.filter(p => p.weightDone > 0).slice(0, 3);
+  // NEEDS ATTENTION = behind on a REAL load (so a lightly-loaded person who
+  // did their bit isn't unfairly flagged). Low % + meaningful weight.
+  const watchList = perEmployee
+    .filter(p => p.weightTotal >= 5 && (p.pct ?? 1) < 0.60)
+    .sort((a, b) => (a.pct ?? 1) - (b.pct ?? 1))
+    .slice(0, 3);
 
   return {
     totalIssues,
     doneIssues,
+    devCompleteIssues,
     totalWeight: Math.round(totalWeight * 10) / 10,
     doneWeight: Math.round(doneWeight * 10) / 10,
     pctWeight: totalWeight > 0 ? doneWeight / totalWeight : 0,
@@ -258,19 +347,21 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   const selected = snapshots.find((s) => s.cycle_id === selectedSnapshotId)
                  ?? snapshots[snapshots.length - 1];
 
-  const employees = await getSnapshotEmployeesWithDelta(selected.cycle_id);
-
   // ── v3 per-issue data ────────────────────────────────────────────────
   // Now uses the cross-snapshot query so employees who appeared earlier
   // in the cycle (and got dropped by Esha because they finished early
   // or briefly had no active work) stay visible with their last-known
   // state.  See getCycleIssuesAcrossSnapshots for the rationale.
-  const [crossSnap, completenessByEmployee, prevChangesByIssue, priorCycleByIssue] = await Promise.all([
+  const [crossSnap, completenessByEmployee, prevChanges, priorCycleByIssue] = await Promise.all([
     getCycleIssuesAcrossSnapshots(team, cycleName, selected.cycle_id, selected.snapshot_at),
     getCycleCompleteness(selected.cycle_id),
     getCyclePreviousSnapshotChanges(team, cycleName, selected.snapshot_at),
     getCrossCyclePriorAppearance(team, cycleName),
   ]);
+  // prevChanges is the new structured result.  Per-row "↑ from X"
+  // indicators still want the original by-id map, so we keep it under
+  // the old name for that path.
+  const prevChangesByIssue = prevChanges.changes;
   const issuesByEmployee = crossSnap.issuesByEmployee;
   const lastSeenByEmployee = crossSnap.lastSeenByEmployee;
   const currentEmployeeSet = new Set(crossSnap.currentEmployeeNames);
@@ -282,6 +373,40 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   const cycleEndForScoring = selected.cycle_end
     ? selected.cycle_end + "T23:59:59Z"
     : "2099-12-31T23:59:59Z";
+
+  // ── Per-employee summary rows for the "Employees as of" table ──────────
+  // Built from the SAME V3 per-issue data the cards use (so the table and
+  // the cards agree).  % is the status-credit score; "done" counts mean
+  // dev-complete (past QA).  Δ tickets/SP come from issues that are NEW vs
+  // the previous snapshot (empty at a fresh baseline).
+  const _newIdSet = new Set(prevChanges.newIssueIds);
+  const summaryRows = Object.entries(issuesByEmployee).map(([name, issues]) => {
+    const score = computeEmployeeScore(issues, cycleEndForScoring);
+    const sp = (i: { story_points?: number | string | null }) => Number(i.story_points ?? 0) || 0;
+    const spTotal = issues.reduce((s, i) => s + sp(i), 0);
+    // SP-done is STRICT: only SP whose issue is truly shipped (Approved for
+    // Prod / Released / Done, credit ≥ 0.95).  Work still in QA/review does
+    // NOT count here — that nuance lives in the % (graded) column instead.
+    const isShipped = (i: import("@/lib/queries").CycleIssue) => (statusCredit(i) ?? 0) >= 0.95;
+    const spDone = issues.filter(isShipped).reduce((s, i) => s + sp(i), 0);
+    const newOnes = issues.filter((i) => _newIdSet.has(i.issue_id));
+    const stages: Record<StageKey, number> = { not_started: 0, building: 0, in_qa: 0, done: 0 };
+    for (const i of issues) {
+      const b = stageBucket(i);
+      if (b) stages[b] += 1;
+    }
+    return {
+      name,
+      tickets_total: issues.length,
+      stages,
+      sp_total: spTotal,
+      sp_done: spDone,
+      pct: score.pctComplete,
+      classification: score.classification,
+      tickets_added: newOnes.length,
+      sp_added: newOnes.reduce((s, i) => s + sp(i), 0),
+    };
+  }).sort((a, b) => (b.pct ?? -1) - (a.pct ?? -1));
 
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
@@ -406,11 +531,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
             {/* 5-stat strip — HR-at-a-glance */}
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
               <StatTile label="Team weight" value={`${fmt(pulse.doneWeight)} / ${fmt(pulse.totalWeight)}`}
-                        sub={`${pctOverall}% complete`}
+                        sub={`${pctOverall}% complete (status-weighted)`}
                         accent={pctOverall >= 60 ? "emerald" : pctOverall >= 30 ? "amber" : "rose"} />
-              <StatTile label="Issues"
-                        value={`${pulse.doneIssues} / ${totalIssuesAll}`}
-                        sub={`${totalIssuesAll - pulse.doneIssues} open`} />
+              <StatTile label="Dev-complete"
+                        value={`${pulse.devCompleteIssues} / ${totalIssuesAll}`}
+                        sub={`${pulse.doneIssues} shipped · ${totalIssuesAll - pulse.devCompleteIssues} in flight`}
+                        accent={pulse.devCompleteIssues >= totalIssuesAll * 0.6 ? "emerald" : pulse.devCompleteIssues >= totalIssuesAll * 0.3 ? "amber" : "rose"} />
               <StatTile label="Classification" value={`${pulse.nHigh} H · ${pulse.nMid} M · ${pulse.nLow} L`}
                         sub={`${pulse.nHigh + pulse.nMid + pulse.nLow} scored`}
                         accent={pulse.nLow > pulse.nHigh ? "rose" : "emerald"} />
@@ -485,7 +611,9 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
               <div className="bg-white rounded-xl border border-stone-200 p-5">
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <div className="text-xs uppercase tracking-wider text-emerald-600 mb-2">Leaders</div>
+                    <div className="text-xs uppercase tracking-wider text-emerald-600 mb-2"
+                         title="Ranked by difficulty-weighted progress delivered (volume × how-far × quality) — NOT raw completion %, so one tiny finished ticket can't top the list.">
+                      Top performers</div>
                     {pulse.topPerformers.length === 0 ? (
                       <div className="text-xs text-slate-400 italic">Nobody completed work yet</div>
                     ) : (
@@ -498,14 +626,16 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                               : "bg-amber-50 text-amber-700"
                             }`}>{i + 1}</span>
                             <span className="text-slate-800 font-medium flex-1 truncate">{p.name}</span>
-                            <span className="text-[11px] tabular-nums text-slate-500">{p.pct !== null ? Math.round(p.pct * 100) : "—"}%</span>
+                            <span className="text-[11px] tabular-nums text-slate-500" title="output = weighted progress delivered">{fmt(p.weightDone)}</span>
                           </li>
                         ))}
                       </ul>
                     )}
                   </div>
                   <div>
-                    <div className="text-xs uppercase tracking-wider text-rose-600 mb-2">Needs attention</div>
+                    <div className="text-xs uppercase tracking-wider text-rose-600 mb-2"
+                         title="Behind on a real workload: completion under 60% with meaningful weight assigned. Lightly-loaded people are not flagged here.">
+                      Needs attention</div>
                     {pulse.watchList.length === 0 ? (
                       <div className="text-xs text-slate-400 italic">All clear</div>
                     ) : (
@@ -514,8 +644,8 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                           <li key={p.name} className="flex items-center gap-2 text-sm">
                             <span className="inline-block w-1.5 h-1.5 rounded-full bg-rose-500" />
                             <span className="text-slate-800 font-medium flex-1 truncate">{p.name}</span>
-                            <span className="text-[11px] tabular-nums text-slate-500">
-                              {fmt(p.weightTotal)} wt
+                            <span className="text-[11px] tabular-nums text-rose-600 font-medium">
+                              {p.pct !== null ? Math.round(p.pct * 100) : "—"}%
                             </span>
                           </li>
                         ))}
@@ -561,68 +691,72 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
           <table className="w-full text-sm">
             <thead className="bg-stone-50 text-xs uppercase tracking-wider text-slate-500">
               <tr>
-                <th className="text-left px-4 py-3">Employee</th>
-                <th className="text-right px-4 py-3">Tickets</th>
-                <th className="text-right px-4 py-3">Δ tix</th>
-                <th className="text-right px-4 py-3">SP</th>
-                <th className="text-right px-4 py-3">Δ sp</th>
-                <th className="text-right px-4 py-3">%</th>
-                <th className="text-left px-4 py-3">Status</th>
+                <th className="text-left px-4 py-3">
+                  <Hdr tip="The team member. Click any name to open their full personal history.">Employee</Hdr>
+                </th>
+                <th className="text-left px-4 py-3">
+                  <Hdr tip="Where this person's issues sit in the pipeline. GREEN = approved / shipped (truly done). AMBER = in QA / testing (dev work finished, being verified). BLUE = still building / in review. GREY = not started. The number reads: ✓approved + in-QA / total. Hover the bar for exact counts.">Pipeline</Hdr>
+                </th>
+                <th className="text-right px-4 py-3">
+                  <Hdr tip="Δ tickets: how many NEW issues landed on this person since the previous snapshot. Blank at a fresh baseline.">Δ tix</Hdr>
+                </th>
+                <th className="text-right px-4 py-3">
+                  <Hdr tip="Story points SHIPPED / total committed. Strict: only counts issues that reached Approved-for-Prod or later. Work still in QA/review is NOT counted here — see the % column for graded progress.">SP shipped</Hdr>
+                </th>
+                <th className="text-right px-4 py-3">
+                  <Hdr tip="Δ story points: SP added since the previous snapshot.">Δ sp</Hdr>
+                </th>
+                <th className="text-right px-4 py-3">
+                  <Hdr tip="Status-weighted completion — the score. Every issue earns partial credit by stage: In QA 80%, Approved 95%, Done 100%. This is why someone with 0 fully-shipped issues can still be 70%+.">%</Hdr>
+                </th>
+                <th className="text-left px-4 py-3">
+                  <Hdr tip="Band from the %: on track (≥80%), mid (60–79%), behind (<60%).">Status</Hdr>
+                </th>
               </tr>
             </thead>
             <tbody>
-              {employees.map((e) => {
-                const tixPct = e.tickets_total
-                  ? Math.round(((e.tickets_completed ?? 0) / e.tickets_total) * 100)
-                  : null;
-                const tone = tixPct === null ? "text-slate-400"
-                  : tixPct >= 80 ? "text-emerald-700"
-                  : tixPct >= 60 ? "text-amber-700"
+              {summaryRows.map((e) => {
+                const pctNum = e.pct === null ? null : Math.round(e.pct * 100);
+                const tone = pctNum === null ? "text-slate-400"
+                  : pctNum >= 80 ? "text-emerald-700"
+                  : pctNum >= 60 ? "text-amber-700"
                   : "text-rose-700";
                 const scopeGrew = e.tickets_added > 0 || e.sp_added > 0;
                 return (
-                  <tr key={e.employee_name}
+                  <tr key={e.name}
                       className={`border-t border-stone-100 hover:bg-stone-50 ${scopeGrew ? "bg-amber-50/30" : ""}`}>
                     <td className="px-4 py-3 font-medium text-slate-900">
                       <Link
-                        href={`/employees/${encodeURIComponent(e.employee_name)}?cycle=${encodeURIComponent(cycleName)}`}
-                        className="hover:text-[#AE00D0]"
+                        href={`/employees/${encodeURIComponent(e.name)}?cycle=${encodeURIComponent(cycleName)}`}
+                        className="hover:text-[#AE00D0] hover:underline"
                       >
-                        {e.employee_name}
+                        {e.name}
                       </Link>
                     </td>
-                    <td className="px-4 py-3 text-right tabular-nums">
-                      {e.tickets_completed ?? 0}/{e.tickets_total ?? 0}
+                    <td className="px-4 py-3">
+                      <StageBar stages={e.stages} total={e.tickets_total} />
                     </td>
                     <td className={`px-4 py-3 text-right tabular-nums text-xs ${
-                      e.tickets_added > 0 ? "text-amber-700 font-semibold"
-                      : e.tickets_added < 0 ? "text-blue-700"
-                      : "text-slate-300"
+                      e.tickets_added > 0 ? "text-amber-700 font-semibold" : "text-slate-300"
                     }`}>
-                      {e.tickets_added > 0 ? `+${e.tickets_added}`
-                        : e.tickets_added < 0 ? `${e.tickets_added}`
-                        : "·"}
+                      {e.tickets_added > 0 ? `+${e.tickets_added}` : "·"}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">
-                      {e.story_points_completed ?? 0}/{e.story_points_total ?? 0}
+                      {fmtNum(e.sp_done)}/{fmtNum(e.sp_total)}
                     </td>
                     <td className={`px-4 py-3 text-right tabular-nums text-xs ${
-                      e.sp_added > 0 ? "text-amber-700 font-semibold"
-                      : e.sp_added < 0 ? "text-blue-700"
-                      : "text-slate-300"
+                      e.sp_added > 0 ? "text-amber-700 font-semibold" : "text-slate-300"
                     }`}>
-                      {e.sp_added > 0 ? `+${e.sp_added}`
-                        : e.sp_added < 0 ? `${e.sp_added}`
-                        : "·"}
+                      {e.sp_added > 0 ? `+${fmtNum(e.sp_added)}` : "·"}
                     </td>
                     <td className={`px-4 py-3 text-right tabular-nums font-medium ${tone}`}>
-                      {pct(e.tickets_completed, e.tickets_total)}
+                      {pctNum === null ? "—" : `${pctNum}%`}
                     </td>
                     <td className="px-4 py-3">{classBadge(e.classification)}</td>
                   </tr>
                 );
               })}
-              {employees.length === 0 && (
+              {summaryRows.length === 0 && (
                 <tr><td colSpan={7} className="px-4 py-10 text-center text-slate-400">
                   No employees in this snapshot.
                 </td></tr>
@@ -631,20 +765,34 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
           </table>
         </div>
 
-        <p className="mt-3 text-xs text-slate-500 leading-relaxed">
-          <span className="text-amber-700 font-semibold">+N</span> = tickets / SP added vs the previous snapshot (scope grew).
-          <span className="text-blue-700 font-semibold ml-2">−N</span> = removed.
-          Rows highlighted amber = scope expanded for that employee mid-cycle.
-          Apply a grace mark from the Slack DM at end-of-cycle to compensate, e.g.
-          <code className="ml-1">give +1 to mayank in May — completed all original commitments</code>.
-        </p>
+        <div className="mt-3 text-xs text-slate-500 leading-relaxed space-y-1.5">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span className="font-semibold text-slate-700">Pipeline bar:</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2.5 rounded-sm" style={{ background: "#10b981" }} /> approved / shipped</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2.5 rounded-sm" style={{ background: "#f59e0b" }} /> in QA / testing</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2.5 rounded-sm" style={{ background: "#60a5fa" }} /> building / review</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2.5 rounded-sm" style={{ background: "#cbd5e1" }} /> not started</span>
+          </div>
+          <p>
+            The bar shows <b>where each person&apos;s work actually sits</b> — so &ldquo;24/30&rdquo; can&apos;t be misread as &ldquo;24 finished.&rdquo;
+            The number reads <span className="text-emerald-700 font-semibold">✓ approved</span> <span className="text-amber-600 font-semibold">+ in-QA</span> / total. Hover for exact counts.
+            <span className="font-semibold text-slate-700 ml-2">%</span> = status-weighted completion (the score: In QA 80% → Approved 95% → Done 100%).
+            <span className="text-amber-700 font-semibold ml-2">+N</span> = added since the previous snapshot. Click a name for full history.
+          </p>
+        </div>
       </section>
 
       {/* ─── What changed since previous snapshot ─────────────────────── */}
-      {hasV3Data && Object.keys(prevChangesByIssue).length > 0 && (() => {
+      {/* Renders whenever a previous snapshot exists in the SAME cycle.
+          On Day 1 of a cycle prevChanges.prevSnapshotAt is null and the
+          card stays hidden (a "Day 1 — nothing to diff yet" message
+          would also be reasonable; we just hide for now to keep the
+          page clean).  When it's Day 2+ the card ALWAYS renders even
+          if every bucket is 0 — that way the absence of activity is
+          itself visible, instead of the card mysteriously disappearing. */}
+      {hasV3Data && prevChanges.prevSnapshotAt && (() => {
         const changes = Object.values(prevChangesByIssue);
-        // Bucket by type of change
-        const prevSnapshotAt = changes[0]?.prev_snapshot_at;
+        const prevSnapshotAt = prevChanges.prevSnapshotAt;
         const allIssuesFlat = Object.values(issuesByEmployee).flat();
         const issueById = new Map(allIssuesFlat.map(i => [i.issue_id, i]));
         let nPriority = 0, nSp = 0, nStatusDone = 0, nStatusOther = 0, nReassigned = 0;
@@ -659,6 +807,10 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
           }
           if (cur.employee_name !== c.prev_employee_name)   nReassigned++;
         }
+        const nNew = prevChanges.newIssueIds.length;
+        const nDropped = prevChanges.droppedIssueIds.length;
+        const totalActivity =
+          nStatusDone + nPriority + nSp + nStatusOther + nReassigned + nNew + nDropped;
         return (
           <section className="mt-10">
             <div className="bg-gradient-to-br from-violet-50/40 via-white to-amber-50/30 border border-violet-100 rounded-2xl p-5">
@@ -666,24 +818,55 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-600">
                   What changed since previous snapshot
                 </h2>
-                {prevSnapshotAt && (
-                  <span className="text-xs text-slate-500">
-                    diff vs <b className="text-slate-700">{new Date(prevSnapshotAt).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}</b>
-                  </span>
-                )}
+                <span className="text-xs text-slate-500">
+                  diff vs <b className="text-slate-700">{new Date(prevSnapshotAt).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}</b>
+                </span>
               </div>
-              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                <DiffPill icon="✓" label="Completed" count={nStatusDone}    accent="emerald" />
-                <DiffPill icon="↑" label="Priority bumped" count={nPriority} accent="amber" />
-                <DiffPill icon="↑" label="SP re-pointed" count={nSp}         accent="violet" />
-                <DiffPill icon="↻" label="Status flipped" count={nStatusOther} accent="blue" />
-                <DiffPill icon="↻" label="Reassigned" count={nReassigned}    accent="rose" />
+              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+                <DiffPill icon="✓" label="Completed"       count={nStatusDone}   accent="emerald" />
+                <DiffPill icon="↑" label="Priority bumped" count={nPriority}     accent="amber" />
+                <DiffPill icon="↑" label="SP re-pointed"   count={nSp}           accent="violet" />
+                <DiffPill icon="↻" label="Status flipped"  count={nStatusOther}  accent="blue" />
+                <DiffPill icon="↻" label="Reassigned"      count={nReassigned}   accent="rose" />
+                <DiffPill icon="+" label="New issues"      count={nNew}          accent="violet" />
+                <DiffPill icon="−" label="Dropped"         count={nDropped}      accent="amber" />
               </div>
-              <p className="text-[11px] text-slate-500 mt-3">
-                Mid-cycle changes are normal — but a flurry of priority bumps or status reversals close to cycle end is worth a PM conversation.
-                Each affected issue row shows a small <span className="text-violet-600 font-medium">↑ from X</span> indicator
-                so you can see exactly what shifted.
-              </p>
+              {totalActivity === 0 ? (
+                <p className="text-[11px] text-slate-500 mt-3">
+                  Quiet day — no priority / SP / status / assignee changes and
+                  no issues added or removed.  Not unusual mid-cycle, especially
+                  in the first 24–48 hours after a sprint starts.
+                </p>
+              ) : (
+                <>
+                  <p className="text-[11px] text-slate-500 mt-3">
+                    Mid-cycle changes are normal — but a flurry of priority bumps
+                    or status reversals close to cycle end is worth a PM
+                    conversation. Each affected issue row shows a small{" "}
+                    <span className="text-violet-600 font-medium">↑ from X</span>{" "}
+                    indicator so you can see exactly what shifted.
+                  </p>
+                  {(nNew > 0 || nDropped > 0) && (
+                    <p className="text-[11px] text-slate-500 mt-2">
+                      {nNew > 0 && (
+                        <>
+                          <span className="font-medium text-slate-700">New today:</span>{" "}
+                          {prevChanges.newIssueIds.slice(0, 12).join(", ")}
+                          {prevChanges.newIssueIds.length > 12 ? ` +${prevChanges.newIssueIds.length - 12} more` : ""}.{" "}
+                        </>
+                      )}
+                      {nDropped > 0 && (
+                        <>
+                          <span className="font-medium text-slate-700">Dropped:</span>{" "}
+                          {prevChanges.droppedIssueIds.slice(0, 12).join(", ")}
+                          {prevChanges.droppedIssueIds.length > 12 ? ` +${prevChanges.droppedIssueIds.length - 12} more` : ""}.
+                          {nDropped > 0 && " Worth confirming whether these were intentional descopes."}
+                        </>
+                      )}
+                    </p>
+                  )}
+                </>
+              )}
             </div>
           </section>
         );
@@ -708,58 +891,95 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
               </div>
             </summary>
             <div className="px-4 pb-4 pt-2 border-t border-violet-100">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+              <p className="text-[13px] text-slate-600 leading-relaxed mb-4">
+                A person&apos;s score is <b>not</b> &ldquo;how many issues are fully closed.&rdquo; It&apos;s
+                <b> how far their work has moved through the pipeline.</b> Every issue earns
+                partial credit as it advances — most of it by the time the developer hands off
+                to QA. That&apos;s why someone with <b>0 formally-Done issues can still score 70%+</b>:
+                their work is finished and sitting in QA / review / approved, just not closed.
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4 text-sm">
+                {/* ── Status-credit ladder ── */}
                 <div>
-                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Columns</h3>
-                  <dl className="space-y-2 text-[13px]">
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Priority</dt><dd className="text-slate-600">Business urgency — p0 (critical), p1 (high), p2 (normal), low.</dd></div>
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Story points</dt><dd className="text-slate-600">Effort estimate set by PM/PL during planning. <b>If missing</b>, we use 1 (the minimum) and flag the row — PM should add an estimate.</dd></div>
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Weighted effort</dt><dd className="text-slate-600">Contribution to score: <code className="text-[11px] bg-stone-100 px-1 rounded">SP × priority multiplier</code>. A p0 issue counts 2× a p2 of the same size.</dd></div>
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Target days</dt><dd className="text-slate-600">How long this issue should take (in whole days): <code className="text-[11px] bg-stone-100 px-1 rounded">SP × time factor</code>, always rounded up. Min 1 day.</dd></div>
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Schedule fit</dt><dd className="text-slate-600">Is there enough time left in the cycle? See the lane formula below.</dd></div>
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Status</dt><dd className="text-slate-600">Where the work is — todo, in progress, done. Only <b>done</b> issues add to the numerator.</dd></div>
-                    <div className="flex gap-2"><dt className="font-semibold text-slate-700 w-32 flex-none">Assigned</dt><dd className="text-slate-600">The day this issue landed on this person&apos;s plate (decides Schedule fit).</dd></div>
-                  </dl>
-                </div>
-                <div>
-                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Multipliers (per priority)</h3>
-                  <table className="w-full text-[12px] mb-4">
+                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Credit by status (the engine)</h3>
+                  <table className="w-full text-[12px]">
                     <thead className="text-[10px] uppercase tracking-wider text-slate-400">
-                      <tr><th className="text-left pb-1">priority</th><th className="text-right pb-1">effort ×</th><th className="text-right pb-1">time ×</th></tr>
+                      <tr><th className="text-left pb-1">status</th><th className="text-right pb-1">credit</th><th className="text-left pb-1 pl-3">meaning</th></tr>
                     </thead>
                     <tbody className="tabular-nums">
-                      <tr className="border-t border-violet-100"><td className="py-1.5"><span className="bg-rose-100 text-rose-800 rounded px-1.5 py-0.5 font-mono text-[10px]">p0</span> critical</td><td className="text-right text-rose-700 font-bold">2.0</td><td className="text-right text-slate-600">0.6 × SP</td></tr>
-                      <tr className="border-t border-violet-100"><td className="py-1.5"><span className="bg-amber-100 text-amber-800 rounded px-1.5 py-0.5 font-mono text-[10px]">p1</span> high</td><td className="text-right text-amber-700 font-bold">1.5</td><td className="text-right text-slate-600">0.8 × SP</td></tr>
-                      <tr className="border-t border-violet-100"><td className="py-1.5"><span className="bg-stone-100 text-slate-700 rounded px-1.5 py-0.5 font-mono text-[10px]">p2</span> normal</td><td className="text-right text-slate-700 font-bold">1.0</td><td className="text-right text-slate-600">1.0 × SP</td></tr>
-                      <tr className="border-t border-violet-100"><td className="py-1.5"><span className="bg-slate-50 text-slate-500 rounded px-1.5 py-0.5 font-mono text-[10px]">low</span> nice-to-have</td><td className="text-right text-slate-500 font-bold">0.7</td><td className="text-right text-slate-600">1.5 × SP</td></tr>
+                      {[
+                        ["Todo / Backlog", "0%", "not started", "text-slate-400"],
+                        ["In Development", "35%", "actively building", "text-slate-600"],
+                        ["Code Review", "60%", "code written, in review", "text-slate-600"],
+                        ["In Review", "70%", "later review", "text-slate-600"],
+                        ["In QA / Ready-Deploy", "80%", "dev work DONE — handoff", "text-emerald-700 font-semibold"],
+                        ["PT Review", "88%", "product testing", "text-slate-600"],
+                        ["Approved for Prod", "95%", "passed all gates", "text-slate-600"],
+                        ["Released / Done", "100%", "shipped / closed", "text-slate-600"],
+                      ].map(([s, c, m, cls]) => (
+                        <tr key={s as string} className="border-t border-violet-100">
+                          <td className="py-1 pr-2">{s}</td>
+                          <td className={`text-right font-bold ${cls}`}>{c}</td>
+                          <td className="pl-3 text-slate-500 text-[11px]">{m}</td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
-                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Schedule-fit lanes</h3>
-                  <ul className="space-y-1.5 text-[12px]">
-                    <li className="flex items-start gap-2">
-                      <span className="inline-block text-[10px] bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-200 rounded-full px-2 py-0.5 flex-none mt-0.5">Normal</span>
-                      <span className="text-slate-600">Days left ≥ <b>1.5× Target days</b> — relaxed pace, full weight counts.</span>
-                    </li>
-                    <li className="flex items-start gap-2">
-                      <span className="inline-block text-[10px] bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-2 py-0.5 flex-none mt-0.5">Tight-fair</span>
-                      <span className="text-slate-600">Days left ≥ Target days but &lt; 1.5× — tight but doable. <b>+20% bonus</b> if completed.</span>
-                    </li>
-                    <li className="flex items-start gap-2">
-                      <span className="inline-block text-[10px] bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200 rounded-full px-2 py-0.5 flex-none mt-0.5">Late dump</span>
-                      <span className="text-slate-600">Days left &lt; Target days — not enough time. <b>Excluded from employee score</b>, shown to PM as a planning signal.</span>
-                    </li>
-                  </ul>
+                  <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+                    The last 80%→100% is a <b>quality reserve</b>: released only as QA/PT/Prod confirm
+                    the work is clean. If QA finds a bug and bounces it back, the status drops — so the
+                    credit drops automatically — and a re-completion lands at <b>0.7×</b> (rework).
+                  </p>
+                </div>
+
+                {/* ── Worked example ── */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Worked example — 0 done, still ~73%</h3>
+                  <p className="text-[12px] text-slate-600 leading-relaxed mb-2">
+                    An engineer with <b>30 issues, none formally &ldquo;Done&rdquo;</b>, but most past the QA line:
+                  </p>
+                  <table className="w-full text-[12px] tabular-nums">
+                    <tbody>
+                      <tr className="border-t border-violet-100"><td className="py-1">6 × Approved for Prod</td><td className="text-right text-slate-500">×0.95</td><td className="text-right font-medium">≈ 8.1</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">6 × PT Review</td><td className="text-right text-slate-500">×0.88</td><td className="text-right font-medium">≈ 5.0</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">9 + 3 × In QA / Ready</td><td className="text-right text-slate-500">×0.80</td><td className="text-right font-medium">≈ 14.8</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">3 × In Development</td><td className="text-right text-slate-500">×0.35</td><td className="text-right font-medium">≈ 1.0</td></tr>
+                      <tr className="border-t border-violet-100"><td className="py-1">3 × Todo</td><td className="text-right text-slate-500">×0.00</td><td className="text-right font-medium">0</td></tr>
+                    </tbody>
+                    <tfoot>
+                      <tr className="border-t-2 border-violet-200 font-semibold">
+                        <td className="py-1.5">earned ÷ total weight</td>
+                        <td className="text-right" colSpan={2}>30.9 ÷ 42.2 = <span className="text-amber-700">73%</span></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                  <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+                    Each row&apos;s weight = <code className="text-[10px] bg-stone-100 px-1 rounded">SP × priority</code>
+                    {" "}(p0 2.0 / p1 1.5 / p2 1.0 / low 0.7; missing SP → 1). The % is the weighted credit.
+                  </p>
                 </div>
               </div>
-              <div className="mt-4 pt-4 border-t border-violet-100 text-[12px] text-slate-600 leading-relaxed">
-                <b>Final score per employee</b>:{" "}
-                <code className="text-[11px] bg-white border border-stone-200 px-2 py-0.5 rounded">
-                  pct = sum of weight(done) ÷ sum of weight(counted lanes)
-                </code>{" "}
-                — then mapped to <span className="text-emerald-700 font-semibold">HIGH (≥80%)</span> /{" "}
-                <span className="text-amber-700 font-semibold">MID (60–79%)</span> /{" "}
-                <span className="text-rose-700 font-semibold">LOW (&lt;60%)</span>.
-                Mid-cycle scores are previews; the permanent score is written only on cycle-end day. HR can apply grace marks on top.
+
+              <div className="mt-4 pt-4 border-t border-violet-100 text-[12px] text-slate-600 leading-relaxed space-y-2">
+                <div>
+                  <b>Score per employee</b>:{" "}
+                  <code className="text-[11px] bg-white border border-stone-200 px-2 py-0.5 rounded">
+                    % = Σ (weight × status-credit) ÷ Σ weight
+                  </code>{" "}
+                  → <span className="text-emerald-700 font-semibold">HIGH ≥80%</span> /{" "}
+                  <span className="text-amber-700 font-semibold">MID 60–79%</span> /{" "}
+                  <span className="text-rose-700 font-semibold">LOW &lt;60%</span>.
+                  <b> Team weight</b> is the same formula summed across everyone&apos;s issues.
+                  Mid-cycle scores are live previews; finalised on cycle-end day. HR can add grace marks.
+                </div>
+                <div>
+                  <b>How we know an issue belongs to this cycle:</b> Linear tells us directly — every
+                  issue carries the cycle it&apos;s in, so membership is exact <i>regardless of whether it
+                  has an assigned date</i>. We do <b>not</b> guess from the issue number (AB-512 → AB-513
+                  is just creation order, not cycle membership). An issue with no &ldquo;assigned&rdquo; date
+                  still counts if Linear placed it in this cycle — it simply shows &ldquo;—&rdquo; for the date.
+                </div>
               </div>
             </div>
           </details>
@@ -808,7 +1028,12 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                         {empName.charAt(0).toUpperCase()}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <div className="font-medium text-slate-900 truncate">{empName}</div>
+                        <Link
+                          href={`/employees/${encodeURIComponent(empName)}?cycle=${encodeURIComponent(cycleName)}`}
+                          className="font-medium text-slate-900 truncate hover:text-[#AE00D0] hover:underline"
+                        >
+                          {empName}
+                        </Link>
                         <div className="text-[11px] text-slate-500 tabular-nums">
                           {issues.length} issue{issues.length !== 1 ? "s" : ""} · weight {score.weightDone}/{score.weightTotal} · {pctStr}
                         </div>
@@ -947,6 +1172,32 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                                     </span>
                                   </div>
                                 )}
+                                {/* QA-bug quality flag. Drives the rework
+                                    penalty in scoring. */}
+                                {(() => {
+                                  const qs = qualityState(it);
+                                  if (qs === "clean") return null;
+                                  const n = reopenCount(it);
+                                  if (qs === "open_bug") {
+                                    return (
+                                      <div className="mt-0.5">
+                                        <span title={`QA caught a bug after this was marked done${n > 1 ? ` ${n} times` : ""}. The original developer has zero credit for this issue until it's marked done again. The next completion will land at ${REWORK_PENALTY}× normal weight to reflect the rework cost.`}
+                                              className="inline-block text-[10px] bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200 rounded-full px-2 py-0.5 whitespace-nowrap font-medium">
+                                          🔴 Open bug{n > 1 ? ` (×${n})` : ""}
+                                        </span>
+                                      </div>
+                                    );
+                                  }
+                                  // reworked: completed but had ≥1 prior reopen
+                                  return (
+                                    <div className="mt-0.5">
+                                      <span title={`This was completed, then QA found a bug (after >24h, so it wasn't a self-correction), then it was re-completed. Lands at ${REWORK_PENALTY}× normal weight to reflect the rework cost.`}
+                                            className="inline-block text-[10px] bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-2 py-0.5 whitespace-nowrap font-medium">
+                                        ⚠ Reworked{n > 1 ? ` (×${n})` : ""} · {REWORK_PENALTY}× weight
+                                      </span>
+                                    </div>
+                                  );
+                                })()}
                               </td>
                               <td className="px-3 py-2.5">
                                 <div className="flex flex-col gap-0.5">
@@ -1038,6 +1289,14 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
             and lane formula. Rows with an <span className="bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-1.5 text-[10px]">no estimate</span> badge
             mean the PM has not assigned story points yet — their weight is held
             at the 1-SP minimum until they do.
+          </p>
+          <p className="mt-2 text-xs text-slate-500 leading-relaxed max-w-3xl">
+            <b>Quality badges:</b> a <span className="bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200 rounded-full px-1.5 text-[10px] font-medium">🔴 Open bug</span> means
+            QA found a problem after the developer marked it done — the developer holds
+            zero credit until the fix lands.  A <span className="bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 rounded-full px-1.5 text-[10px] font-medium">⚠ Reworked</span> means
+            the issue was completed → reopened → completed again; it counts at <b>{REWORK_PENALTY}× weight</b> to
+            reflect the rework cost. Same-day self-corrections (within 24h of completion)
+            are NOT counted as QA failures.
           </p>
         </section>
       )}

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import {
   getEmployeeTrend,
   getEmployeeTrendFilled,
+  getEmployeeStatusCreditTrend,
   getEmployeeRollup,
   getIssuesForEmployeeByCycle,
   currentPeriod,
@@ -14,7 +15,8 @@ import { EmployeeRollupView } from "@/components/EmployeeRollupView";
 import { BackButton } from "@/components/BackButton";
 import {
   computeWeight, computeExpectedDays, classifyLane, isCompleted,
-  hasSpEstimate, computeEmployeeScore, computeCyclePerformance,
+  hasSpEstimate, computeEmployeeScore, computeCyclePerformance, isDevComplete,
+  statusCredit,
 } from "@/lib/issueScoring";
 
 export const dynamic = "force-dynamic";
@@ -56,7 +58,22 @@ function EmployeeIssueTable({ issues, cycleEnd, hideHeader = false }: {
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[920px] text-sm">
+      {/* table-fixed + shared colgroup → the "first N" table and the
+          "show more" table line up to identical column widths instead of
+          each auto-sizing differently. */}
+      <table className="w-full min-w-[920px] text-sm table-fixed">
+        <colgroup>
+          <col style={{ width: "84px" }} />   {/* Issue ID */}
+          <col />                              {/* Title (flexes) */}
+          <col style={{ width: "64px" }} />   {/* Priority */}
+          <col style={{ width: "92px" }} />   {/* Story Pts */}
+          <col style={{ width: "80px" }} />   {/* Weighted */}
+          <col style={{ width: "92px" }} />   {/* Target Days */}
+          <col style={{ width: "108px" }} />  {/* Schedule Fit */}
+          <col style={{ width: "124px" }} />  {/* Status */}
+          <col style={{ width: "88px" }} />   {/* Assigned */}
+          <col style={{ width: "88px" }} />   {/* Done on */}
+        </colgroup>
         {!hideHeader && (
           <thead className="bg-stone-50/60 text-[11px] uppercase tracking-wider text-slate-500">
             <tr>
@@ -301,9 +318,10 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
   // the cycle gets a point).  The actual (un-filled) trend powers the
   // snapshot-history TABLE below — that table shows only the days Esha
   // genuinely reported, with real day-over-day deltas.
-  const [issuesByCycle, filledTrend] = await Promise.all([
+  const [issuesByCycle, filledTrend, creditTrend] = await Promise.all([
     getIssuesForEmployeeByCycle(name),
     getEmployeeTrendFilled(name),
+    getEmployeeStatusCreditTrend(name),
   ]);
   // Optional cycle filter
   const trend = cycleFilter
@@ -339,19 +357,37 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
     };
   });
 
-  // Chart uses the GAP-FILLED series (one point per snapshot date, ASC).
-  // De-dupe by date defensively in case two snapshots share a calendar day.
-  const filledByDate = new Map<string, typeof filledForChart[number]>();
-  for (const r of filledForChart) filledByDate.set(r.snapshot_at.slice(0, 10), r);
-  const points: EmployeeSnapshotPoint[] = Array.from(filledByDate.values()).map((r) => {
-    const d = new Date(r.snapshot_at);
-    return {
-      label: d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }),
-      tickets_pct: fmtPct(r.tickets_completed, r.tickets_total),
-      sp_pct: fmtPct(r.story_points_completed, r.story_points_total),
-      cycle_name: r.cycle_name,
-    };
-  });
+  // Chart now plots the REAL status-credit % per snapshot (from the
+  // per-issue rows), not the void tickets_pct aggregate.  Two lines:
+  //   • Completion %  = status-weighted credit (the score driver)
+  //   • Dev-done %    = share of issues past the QA handoff (by count)
+  // Source-preferred (Linear wins per cycle).  De-duped per calendar date.
+  const creditFiltered = cycleFilter
+    ? creditTrend.filter((r) => r.cycle_name === cycleFilter)
+    : creditTrend;
+  const creditByDate = new Map<string, typeof creditFiltered>();
+  for (const r of creditFiltered) {
+    const k = r.snapshot_at.slice(0, 10);
+    (creditByDate.get(k) ?? creditByDate.set(k, []).get(k)!).push(r);
+  }
+  const cycleEndForTrend = "2099-12-31T23:59:59Z"; // lanes irrelevant to credit
+  const points: EmployeeSnapshotPoint[] = Array.from(creditByDate.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([dateKey, rows]) => {
+      const issues = rows.map((r) => ({
+        issue_id: r.issue_id, status: r.status,
+        story_points: r.story_points, priority: r.priority, labels: r.labels,
+      }));
+      const score = computeEmployeeScore(issues, cycleEndForTrend);
+      const devDone = issues.filter(isDevComplete).length;
+      const d = new Date(dateKey + "T00:00:00Z");
+      return {
+        label: d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }),
+        tickets_pct: score.pctComplete === null ? null : Math.round(score.pctComplete * 100),
+        sp_pct: issues.length ? Math.round((devDone / issues.length) * 100) : null,
+        cycle_name: rows[0].cycle_name,
+      };
+    });
 
   // Snapshot table uses DESCENDING (newest first) — paginated to `daysShown`
   const tableRowsAll = [...dayRowsWithDelta].reverse();
@@ -522,6 +558,64 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                         {isCurrentCycle ? "Live — updates each daily snapshot until the cycle ends." : "Finalised at cycle end."}
                       </div>
                     </div>
+
+                    {/* ── How this score is calculated — issue by issue ── */}
+                    <details className="border-t border-stone-100 bg-white">
+                      <summary className="cursor-pointer list-none px-4 py-2.5 text-[12px] text-violet-700 hover:bg-violet-50/40 select-none flex items-center gap-2">
+                        <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-violet-100 text-violet-700 text-[9px] font-bold">?</span>
+                        How this {pctStr} is calculated — issue by issue
+                      </summary>
+                      <div className="px-4 pb-4 pt-1">
+                        <p className="text-[11px] text-slate-500 mb-2 leading-relaxed">
+                          Each issue earns <b>weight × status-credit</b>. Weight = SP × priority
+                          (p0 2.0 / p1 1.5 / p2 1.0 / low 0.7; missing SP → 1). Credit grows with
+                          status: In QA 78% → Approved 93% → Done 100%. The score is total earned ÷ total weight.
+                        </p>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-[11.5px] tabular-nums">
+                            <thead className="text-[9px] uppercase tracking-wider text-slate-400 text-left">
+                              <tr>
+                                <th className="py-1 pr-2">Issue</th><th className="py-1 pr-2">Status</th>
+                                <th className="py-1 pr-2 text-right">Weight</th>
+                                <th className="py-1 pr-2 text-right">Credit</th>
+                                <th className="py-1 text-right">Earned</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[...c.issues]
+                                .map(it => {
+                                  const cr = statusCredit(it);
+                                  const w = computeWeight(it);
+                                  return { it, cr, w, earned: cr === null ? 0 : w * cr };
+                                })
+                                .sort((a, b) => b.earned - a.earned)
+                                .map(({ it, cr, w, earned }) => (
+                                  <tr key={it.issue_id} className="border-t border-stone-100">
+                                    <td className="py-1 pr-2 font-mono text-[10.5px] text-slate-600">{it.issue_id}</td>
+                                    <td className="py-1 pr-2 text-slate-600">{cr === null ? "excluded" : it.status}</td>
+                                    <td className="py-1 pr-2 text-right text-slate-500">{w}</td>
+                                    <td className="py-1 pr-2 text-right text-slate-500">{cr === null ? "—" : `${Math.round(cr * 100)}%`}</td>
+                                    <td className="py-1 text-right font-medium text-slate-800">{cr === null ? "—" : earned.toFixed(2)}</td>
+                                  </tr>
+                                ))}
+                            </tbody>
+                            <tfoot>
+                              <tr className="border-t-2 border-violet-200 font-semibold">
+                                <td className="py-1.5" colSpan={2}>Total → score</td>
+                                <td className="py-1.5 text-right">{score.weightTotal}</td>
+                                <td></td>
+                                <td className="py-1.5 text-right text-violet-700">{score.weightDone} = {pctStr}</td>
+                              </tr>
+                            </tfoot>
+                          </table>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                          HR/PM: this is exactly what the score is built from. If an issue&apos;s long pending
+                          time or a circumstance warrants it, apply a <b>grace mark</b> at cycle end — the score
+                          itself stays a faithful mirror of the work&apos;s real status.
+                        </p>
+                      </div>
+                    </details>
 
                     {/* Per-cycle change report — the employee's journey */}
                     {hasChanges ? (

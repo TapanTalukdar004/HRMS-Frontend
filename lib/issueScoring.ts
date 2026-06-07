@@ -45,6 +45,80 @@ export const SP_FALLBACK_WHEN_MISSING = 1.0;
 export const NORMAL_RATIO = 1.5;
 export const TIGHT_BONUS = 1.2;
 
+/**
+ * Quality penalty: a completed issue with ≥1 reopen (QA caught a bug
+ * after the developer marked it done, then it was re-completed) lands
+ * at REWORK_PENALTY × its normal weight.  The verifier's 24h heuristic
+ * filters out same-day self-corrections, so any reopen that survives
+ * represents a real QA failure.
+ *
+ * 0 would be too punitive (work that ships even after rework is still
+ * work delivered).  Full credit erases the quality memory.  0.7 splits
+ * the difference and is the starting heuristic — tune over time.
+ *
+ * MUST mirror perf_tracker/esha/scoring.py:REWORK_PENALTY.
+ */
+export const REWORK_PENALTY = 0.7;
+
+/**
+ * Status-credit ladder — the core of the status-aware scoring model.
+ * MUST mirror perf_tracker/esha/scoring.py:STATUS_CREDIT.
+ *
+ * Graded completion by how far an issue has moved through the Linear
+ * pipeline.  Steep rise as the developer finishes (review → QA handoff
+ * at 0.80), then a 0.20 "quality reserve" released only as QA/PT/Prod
+ * confirm clean.  A QA bounce drops credit automatically (status
+ * regressed); REWORK_PENALTY adds the extra ding on re-completion.
+ *
+ * Keys are normalized via normStatus() and cover real Linear statuses
+ * plus legacy Esha values (todo/in_progress/done) so old rows don't break.
+ */
+export const STATUS_CREDIT: Record<string, number> = {
+  // not started
+  "backlog": 0.0, "in discussion": 0.0, "todo": 0.0,
+  "ready for development": 0.0, "on hold": 0.0,
+  // active development  (gently tightened 2026-06-06 to match scoring.py)
+  "in design": 0.12,
+  "in development": 0.30,
+  "code review": 0.55,
+  "in review": 0.65,
+  // handoff: dev work done; quality reserve (0.78 -> 1.0) begins
+  "in qa": 0.78,
+  "ready to deploy-qa": 0.78,
+  "pt review": 0.86,
+  "approved for prod": 0.93,
+  "released to prod": 1.0,
+  "done": 1.0,
+  // legacy Esha collapsed values
+  "in progress": 0.30, "in_progress": 0.30,
+  "completed": 1.0, "closed": 1.0, "resolved": 1.0,
+};
+
+export const EXCLUDED_STATUS = new Set(["canceled", "cancelled", "duplicate"]);
+export const UNKNOWN_STATUS_CREDIT = 0.35;
+export const DEV_DONE_CREDIT = 0.78;   // In QA line — developer's hands-on work done
+
+function normStatus(raw?: string | null): string {
+  let s = (raw ?? "").trim().toLowerCase();
+  s = s.replace(/\s*-\s*/g, "-").replace(/\s+/g, " ");
+  return s;
+}
+
+/** Graded credit 0..1 from the issue's Linear status. null = excluded
+ *  (canceled/duplicate) so the caller drops it from num AND denom. */
+export function statusCredit(issue: Issue): number | null {
+  const s = normStatus(issue.status);
+  if (!s) return 0.0;
+  if (EXCLUDED_STATUS.has(s)) return null;
+  return s in STATUS_CREDIT ? STATUS_CREDIT[s] : UNKNOWN_STATUS_CREDIT;
+}
+
+/** True once the issue reached the handoff line (In QA or later). */
+export function isDevComplete(issue: Issue): boolean {
+  const c = statusCredit(issue);
+  return c !== null && c >= DEV_DONE_CREDIT;
+}
+
 export const HIGH_THRESHOLD = 0.80;
 export const MID_THRESHOLD  = 0.60;
 
@@ -68,6 +142,10 @@ export type Issue = {
   assigned_at?: string | null;
   completed_at?: string | null;
   snapshot_at?: string | null;
+  /** Count of `reopened` events emitted by the verifier (≥1 = QA failure
+   *  history).  Joined from issue_quality in the query layer; 0 / absent
+   *  when there's no rework. */
+  reopen_count?: number | null;
 };
 
 export type Lane =
@@ -93,11 +171,11 @@ function normPriority(raw?: string | null): keyof typeof PRIORITY_MULTIPLIER {
   if (!raw) return "p2";
   const s = raw.trim().toLowerCase();
   if (s in PRIORITY_MULTIPLIER) return s as keyof typeof PRIORITY_MULTIPLIER;
-  if (s.startsWith("p0") || s === "critical" || s === "blocker") return "p0";
+  if (s.startsWith("p0") || s === "critical" || s === "blocker" || s === "urgent") return "p0";
   if (s.startsWith("p1") || s === "high") return "p1";
   if (s.startsWith("p2") || s === "medium" || s === "normal") return "p2";
   if (s === "low" || s === "minor" || s === "trivial") return "low";
-  return "p2";
+  return "p2";   // "No priority" / unknown
 }
 
 /** True when Esha sent a real SP value > 0 for this issue.
@@ -107,6 +185,31 @@ export function hasSpEstimate(issue: Issue): boolean {
   if (sp === null || sp === undefined) return false;
   const v = Number(sp);
   return Number.isFinite(v) && v > 0;
+}
+
+/** How many times has this issue been reopened (QA-failure heuristic).
+ *  Returns 0 when reopen_count is missing — old query paths still work. */
+export function reopenCount(issue: Issue): number {
+  const v = issue.reopen_count;
+  if (v == null) return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
+/** True when this issue is COMPLETED and has at least one prior reopen.
+ *  Drives the 0.7× weight penalty + the ⚠ Reworked badge. */
+export function isReworkedCompletion(issue: Issue): boolean {
+  return isCompleted(issue) && reopenCount(issue) > 0;
+}
+
+/** Visible quality state for badging on the UI. */
+export type QualityState = "clean" | "reworked" | "open_bug";
+
+export function qualityState(issue: Issue): QualityState {
+  const reopens = reopenCount(issue);
+  if (reopens === 0) return "clean";
+  return isCompleted(issue) ? "reworked" : "open_bug";
 }
 
 function effectiveSP(issue: Issue): number {
@@ -202,43 +305,43 @@ export function computeEmployeeScore(
   };
   const explanation: string[] = [];
 
+  // STATUS-AWARE MODEL (mirrors scoring.py:compute_employee_score).
+  // credited = weight × statusCredit × rework_factor. Lanes still computed
+  // for display/timeliness but no longer gate credit.
   for (const issue of issues) {
-    const lane = classifyLane(issue, cycleEnd);
-    lanes[lane] = (lanes[lane] ?? 0) + 1;
     const w = computeWeight(issue);
     const iid = issue.issue_id || "?";
-    const done = isCompleted(issue);
 
-    // Disposition labels — always excluded.
-    if (lane === "removed") {
-      explanation.push(`${iid}  removed (wontfix/duplicate/cancelled) — excluded (weight ${w})`);
+    const credit = statusCredit(issue);
+    // Excluded (canceled/duplicate) — out of numerator AND denominator.
+    if (credit === null) {
+      lanes.removed = (lanes.removed ?? 0) + 1;
+      explanation.push(`${iid}  excluded (canceled/duplicate) — dropped (weight ${w})`);
+      continue;
+    }
+    // Disposition labels also exclude.
+    if (hasLabel(issue, REMOVE_LABELS)) {
+      lanes.removed = (lanes.removed ?? 0) + 1;
+      explanation.push(`${iid}  removed (wontfix/duplicate label) — dropped (weight ${w})`);
       continue;
     }
 
-    // Late-dump asymmetric rule (mirrors scoring.py):
-    //   • completed   → fully credited (heroic delivery counts!)
-    //   • incomplete  → excluded entirely (no penalty for unfair scope)
-    if (lane === "late_dump") {
-      if (done) {
-        weightTotal += w;
-        weightDone += w;
-        explanation.push(`${iid}  late dump COMPLETED → counted in full (weight ${w})`);
-      } else {
-        explanation.push(`${iid}  late dump not done → excluded, no penalty (weight ${w})`);
-      }
-      continue;
-    }
+    const lane = classifyLane(issue, cycleEnd);
+    if (lane in lanes) lanes[lane] = (lanes[lane] ?? 0) + 1;
 
-    // Normal + tight-fair: always in denominator.
+    const rework = reopenCount(issue) > 0;
+    const effCredit = credit * (rework ? REWORK_PENALTY : 1);
+
     weightTotal += w;
-    if (done) {
-      const effectiveW = lane === "tight" ? w * TIGHT_BONUS : w;
-      weightDone += effectiveW;
-      if (lane === "tight") {
-        explanation.push(
-          `${iid}  tight-fair completed → bonus weight ${Math.round(effectiveW * 100) / 100} (base ${w})`,
-        );
-      }
+    weightDone += w * effCredit;
+
+    if (rework) {
+      explanation.push(
+        `${iid}  credit=${credit} × rework ${REWORK_PENALTY} → ${
+          Math.round(effCredit * 100) / 100} (weight ${w})`,
+      );
+    } else if (credit >= DEV_DONE_CREDIT) {
+      explanation.push(`${iid}  dev-done credit=${credit} (weight ${w})`);
     }
   }
 
