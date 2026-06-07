@@ -565,6 +565,92 @@ export async function getHeldFeaturesByCycle(
 }
 
 
+// ─── Issue map / node-tree ──────────────────────────────────────────────────
+
+export type GraphIssue = {
+  issue_id: string;
+  title: string | null;
+  issue_type: string | null;
+  status: string | null;
+  story_points: number | null;
+  priority: string | null;
+  employee_name: string | null;
+  is_bug_of: string | null;
+  parent_issue_id: string | null;
+  issue_url: string | null;
+};
+
+export type IssueGraph = {
+  team: string;
+  cycle_name: string;
+  cycle_start: string | null;
+  cycle_end: string | null;
+  snapshot_at: string | null;
+  issues: GraphIssue[];
+};
+
+/** All issues for the most-recent snapshot of a (team, cycle), with their
+ *  links — feeds the zoomable Issue Map. Defaults to the latest linear cycle
+ *  if team/cycle omitted. Deduped to one row per issue (latest state). */
+export async function getIssueGraph(
+  team?: string,
+  cycleName?: string,
+): Promise<IssueGraph | null> {
+  // 1. Resolve the target (team, cycle): the most-recently-updated linear cycle.
+  if (!team || !cycleName) {
+    const latest = await q<{ team: string; cycle_name: string }>(
+      `SELECT team, cycle_name
+       FROM performance_cycles
+       WHERE source LIKE 'linear%'
+       ORDER BY COALESCE(snapshot_at, received_at) DESC
+       LIMIT 1`,
+    );
+    if (latest.length === 0) return null;
+    team = team ?? latest[0].team;
+    cycleName = cycleName ?? latest[0].cycle_name;
+  }
+
+  const rows = await q<GraphIssue & {
+    cycle_start: string | null; cycle_end: string | null; snapshot_at: string;
+  }>(
+    `
+    WITH snaps AS (
+      SELECT id, cycle_start, cycle_end,
+             COALESCE(snapshot_at, received_at) AS snap
+      FROM performance_cycles
+      WHERE team = $1 AND cycle_name = $2 ${PREFER_LINEAR_SRC}
+    ),
+    latest AS (SELECT MAX(snap) AS s FROM snaps)
+    SELECT DISTINCT ON (cei.issue_id)
+      cei.issue_id, cei.title, cei.issue_type, cei.status,
+      cei.story_points, cei.priority, cei.employee_name,
+      cei.is_bug_of, cei.parent_issue_id, cei.issue_url,
+      s.cycle_start::text, s.cycle_end::text, s.snap::text AS snapshot_at
+    FROM cycle_employee_issues cei
+    JOIN snaps s ON s.id = cei.cycle_id
+    WHERE s.snap = (SELECT s FROM latest)
+    ORDER BY cei.issue_id, cei.snapshot_at DESC
+    `,
+    [team, cycleName],
+  );
+  if (rows.length === 0) {
+    return { team, cycle_name: cycleName, cycle_start: null, cycle_end: null,
+             snapshot_at: null, issues: [] };
+  }
+  return {
+    team, cycle_name: cycleName,
+    cycle_start: rows[0].cycle_start, cycle_end: rows[0].cycle_end,
+    snapshot_at: rows[0].snapshot_at,
+    issues: rows.map((r) => ({
+      issue_id: r.issue_id, title: r.title, issue_type: r.issue_type,
+      status: r.status, story_points: r.story_points, priority: r.priority,
+      employee_name: r.employee_name, is_bug_of: r.is_bug_of,
+      parent_issue_id: r.parent_issue_id, issue_url: r.issue_url,
+    })),
+  };
+}
+
+
 export type CycleCrossSnapshotResult = {
   /** Issues grouped by their CURRENT assignee.  Each issue appears
    *  exactly once (under whoever holds it now). */

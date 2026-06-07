@@ -57,6 +57,17 @@ export const EmployeesIcon = makeIcon("EmployeesIcon", (
   </>
 ));
 
+export const MapIcon = makeIcon("MapIcon", (
+  <>
+    {/* Node tree: one parent linking to children */}
+    <circle cx="5" cy="12" r="2.5" />
+    <circle cx="18" cy="6" r="2.5" />
+    <circle cx="18" cy="18" r="2.5" />
+    <path d="M7.2 10.8 15.8 6.8" />
+    <path d="M7.2 13.2 15.8 17.2" />
+  </>
+));
+
 export const FileTextIcon = makeIcon("FileTextIcon", (
   <>
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />

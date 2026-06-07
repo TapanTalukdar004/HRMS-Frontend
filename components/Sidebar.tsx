@@ -7,7 +7,7 @@ import { clsx } from "@/lib/cn";
 import { Logo } from "./Logo";
 import {
   TeamsIcon, EmployeesIcon, FileTextIcon, ScrollIcon,
-  AwardIcon, BotIcon, SettingsIcon, ChevronLeftIcon, ChevronRightIcon,
+  AwardIcon, BotIcon, SettingsIcon, ChevronLeftIcon, ChevronRightIcon, MapIcon,
 } from "./icons";
 
 type IconComp = ComponentType<SVGProps<SVGSVGElement> & { size?: number }>;
@@ -28,6 +28,7 @@ const NAV: NavSection[] = [
     items: [
       { href: "/teams",     label: "Teams",     Icon: TeamsIcon },
       { href: "/employees", label: "Employees", Icon: EmployeesIcon },
+      { href: "/map",       label: "Issue Map", Icon: MapIcon },
     ],
   },
   {
