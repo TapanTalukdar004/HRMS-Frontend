@@ -444,6 +444,18 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                 const cyEnd = c.cycle_end ? c.cycle_end + "T23:59:59Z" : "2099-12-31T23:59:59Z";
                 const cyStart = c.cycle_start ? c.cycle_start + "T00:00:00Z" : null;
                 const heldForCycle = heldByCycle[c.cycle_name] ?? new Set<string>();
+                // Feature → linked-bug counts (so a feature that HAD bugs shows it,
+                // even after they're resolved). "Open" = credit < 0.93.
+                const bugParents = new Map<string, { total: number; open: number }>();
+                for (const bi of c.issues) {
+                  if (!isBug(bi)) continue;
+                  const pid = bi.is_bug_of || bi.parent_issue_id;
+                  if (!pid) continue;
+                  const e = bugParents.get(pid) || { total: 0, open: 0 };
+                  e.total += 1;
+                  if ((statusCredit(bi) ?? 0) < 0.93) e.open += 1;
+                  bugParents.set(pid, e);
+                }
                 const perf = computeCyclePerformance(c.issues, cyEnd, cyStart, heldForCycle);
                 const score = { weightDone: perf.weightDone, weightTotal: perf.weightTotal,
                                 classification: perf.classification, pctComplete: perf.throughput };
@@ -614,6 +626,10 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                                       {it.issue_id}
                                       {heldHere && <span title="held — open linked bug" className="ml-1">🛡</span>}
                                       {isBug(it) && <span title={`bug · ${REWORK_PENALTY}×`} className="ml-1">🐞</span>}
+                                      {!isBug(it) && !heldHere && bugParents.get(it.issue_id) && (
+                                        <span title={`Had ${bugParents.get(it.issue_id)!.total} linked bug(s), all resolved — full credit restored.`}
+                                              className="ml-1 text-stone-400">🐞✓</span>
+                                      )}
                                     </td>
                                     <td className="py-1 pr-2 text-slate-600">{cr === null ? "excluded" : it.status}</td>
                                     <td className="py-1 pr-2 text-right text-slate-500">{w}</td>

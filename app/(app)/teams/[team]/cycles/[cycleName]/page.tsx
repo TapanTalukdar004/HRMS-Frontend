@@ -386,6 +386,21 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   // HOLD_CAP). Built once here so summary rows, the per-employee detail, and
   // the issue-row badges all use the SAME hold the Team Pulse uses.
   const held = heldFeatureIds(Object.values(issuesByEmployee).flat() as Issue[]);
+  // Feature → its linked bugs (total + still-open), so EVERY feature that has
+  // captured bugs shows a marker — held (open bug) or "bugs resolved". A bug is
+  // "open" until it reaches Approved/Done (credit ≥ 0.93). Computed by us from
+  // Linear's relations, not a Linear label.
+  const BUG_RESOLVED = 0.93;
+  const bugsByParent = new Map<string, { total: number; open: number }>();
+  for (const bi of Object.values(issuesByEmployee).flat() as Issue[]) {
+    if (!isBug(bi)) continue;
+    const pid = bi.is_bug_of;
+    if (!pid) continue;
+    const e = bugsByParent.get(pid) || { total: 0, open: 0 };
+    e.total += 1;
+    if ((statusCredit(bi) ?? 0) < BUG_RESOLVED) e.open += 1;
+    bugsByParent.set(pid, e);
+  }
   const lastSeenByEmployee = crossSnap.lastSeenByEmployee;
   const currentEmployeeSet = new Set(crossSnap.currentEmployeeNames);
   const reassignedAwayCount = crossSnap.reassignedAwayCount;
@@ -1256,12 +1271,24 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                                       {(it.issue_type || "feature")}
                                     </span>
                                   )}
-                                  {!isBug(it) && held.has(it.issue_id) && (
-                                    <span title="This feature has an OPEN linked bug, so its credit is HELD at 0.78 (In-QA level) until the bug is fixed — then it releases to full."
-                                          className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-violet-100 text-violet-800 ring-1 ring-inset ring-violet-300 rounded px-1.5 py-0.5 shadow-[0_0_6px_rgba(174,0,208,0.30)]">
-                                      🛡 Held · open bug
-                                    </span>
-                                  )}
+                                  {!isBug(it) && (() => {
+                                    const bb = bugsByParent.get(it.issue_id);
+                                    if (!bb) return null;
+                                    if (held.has(it.issue_id)) {
+                                      return (
+                                        <span title={`This feature has ${bb.open} open linked bug${bb.open > 1 ? "s" : ""} (of ${bb.total}). Its credit is HELD at 0.78 (In-QA level) until they're fixed — then it releases to full credit.`}
+                                              className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-violet-100 text-violet-800 ring-1 ring-inset ring-violet-300 rounded px-1.5 py-0.5 shadow-[0_0_6px_rgba(174,0,208,0.30)]">
+                                          🛡 Held · {bb.open} open bug{bb.open > 1 ? "s" : ""}
+                                        </span>
+                                      );
+                                    }
+                                    return (
+                                      <span title={`This feature had ${bb.total} linked bug${bb.total > 1 ? "s" : ""}, now all resolved (Approved/Done) — so it earns its full credit. Each bug is its own issue, counted at ${REWORK_PENALTY}×.`}
+                                            className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide bg-stone-100 text-stone-600 ring-1 ring-inset ring-stone-300 rounded px-1.5 py-0.5">
+                                        🐞 {bb.total} bug{bb.total > 1 ? "s" : ""} · resolved
+                                      </span>
+                                    );
+                                  })()}
                                 </div>
                               </td>
                               <td className="px-3 py-2.5 text-slate-800 max-w-md" title={it.title ?? ""}>
