@@ -391,15 +391,20 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   // "open" until it reaches Approved/Done (credit ≥ 0.93). Computed by us from
   // Linear's relations, not a Linear label.
   const BUG_RESOLVED = 0.93;
-  const bugsByParent = new Map<string, { total: number; open: number }>();
-  for (const bi of Object.values(issuesByEmployee).flat() as Issue[]) {
-    if (!isBug(bi)) continue;
-    const pid = bi.is_bug_of;
-    if (!pid) continue;
-    const e = bugsByParent.get(pid) || { total: 0, open: 0 };
-    e.total += 1;
-    if ((statusCredit(bi) ?? 0) < BUG_RESOLVED) e.open += 1;
-    bugsByParent.set(pid, e);
+  const ownerById = new Map<string, string>();      // issue_id → who owns it
+  const bugsByParent = new Map<string, { total: number; open: number; fixers: Set<string> }>();
+  for (const [emp, list] of Object.entries(issuesByEmployee)) {
+    for (const bi of list as Issue[]) {
+      ownerById.set(bi.issue_id, emp);
+      if (!isBug(bi)) continue;
+      const pid = bi.is_bug_of;
+      if (!pid) continue;
+      const e = bugsByParent.get(pid) || { total: 0, open: 0, fixers: new Set<string>() };
+      e.total += 1;
+      if ((statusCredit(bi) ?? 0) < BUG_RESOLVED) e.open += 1;
+      e.fixers.add(emp);
+      bugsByParent.set(pid, e);
+    }
   }
   const lastSeenByEmployee = crossSnap.lastSeenByEmployee;
   const currentEmployeeSet = new Set(crossSnap.currentEmployeeNames);
@@ -1261,12 +1266,16 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                               <td className="px-3 py-2.5 font-mono text-xs text-slate-600 align-top">
                                 {it.issue_id}
                                 <div className="mt-1 flex flex-col gap-0.5 items-start">
-                                  {isBug(it) ? (
-                                    <span title={it.is_bug_of ? `Bug — belongs to ${it.is_bug_of}. Counted at ${REWORK_PENALTY}× (corrective work).` : `Bug (no linked feature in Linear). Counted at ${REWORK_PENALTY}× (corrective work).`}
+                                  {isBug(it) ? (() => {
+                                    const featOwner = it.is_bug_of ? ownerById.get(it.is_bug_of) : undefined;
+                                    const crossOwner = featOwner && featOwner !== empName ? featOwner : null;
+                                    return (
+                                    <span title={it.is_bug_of ? `Bug — belongs to feature ${it.is_bug_of}${crossOwner ? ` (owned by ${crossOwner}). ${empName} is fixing another person's bug — the fix credit is ${empName}'s; the held feature is ${crossOwner}'s.` : ""}. Counted at ${REWORK_PENALTY}× (corrective work).` : `Bug (no linked feature in Linear). Counted at ${REWORK_PENALTY}× (corrective work).`}
                                           className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300 rounded px-1.5 py-0.5 shadow-[0_0_6px_rgba(244,63,94,0.35)]">
-                                      🐞 Bug{it.is_bug_of ? <span className="font-mono font-semibold normal-case">→{it.is_bug_of}</span> : null}
+                                      🐞 Bug{it.is_bug_of ? <span className="font-mono font-semibold normal-case">→{it.is_bug_of}{crossOwner ? ` (${crossOwner})` : ""}</span> : null}
                                     </span>
-                                  ) : (
+                                    );
+                                  })() : (
                                     <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide bg-sky-50 text-sky-700 ring-1 ring-inset ring-sky-200 rounded px-1.5 py-0.5">
                                       {(it.issue_type || "feature")}
                                     </span>
@@ -1274,18 +1283,20 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                                   {!isBug(it) && (() => {
                                     const bb = bugsByParent.get(it.issue_id);
                                     if (!bb) return null;
+                                    const others = [...bb.fixers].filter((f) => f !== empName);
+                                    const fixBy = others.length ? ` · fix: ${others.join(", ")}` : "";
                                     if (held.has(it.issue_id)) {
                                       return (
-                                        <span title={`This feature has ${bb.open} open linked bug${bb.open > 1 ? "s" : ""} (of ${bb.total}). Its credit is HELD at 0.78 (In-QA level) until they're fixed — then it releases to full credit.`}
+                                        <span title={`This feature has ${bb.open} open linked bug${bb.open > 1 ? "s" : ""} (of ${bb.total}). Its credit is HELD at 0.78 until they're fixed — then it releases to full.${others.length ? ` The fix is assigned to ${others.join(", ")}, not ${empName}.` : ""}`}
                                               className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-violet-100 text-violet-800 ring-1 ring-inset ring-violet-300 rounded px-1.5 py-0.5 shadow-[0_0_6px_rgba(174,0,208,0.30)]">
-                                          🛡 Held · {bb.open} open bug{bb.open > 1 ? "s" : ""}
+                                          🛡 Held · {bb.open} open bug{bb.open > 1 ? "s" : ""}{fixBy}
                                         </span>
                                       );
                                     }
                                     return (
-                                      <span title={`This feature had ${bb.total} linked bug${bb.total > 1 ? "s" : ""}, now all resolved (Approved/Done) — so it earns its full credit. Each bug is its own issue, counted at ${REWORK_PENALTY}×.`}
-                                            className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide bg-stone-100 text-stone-600 ring-1 ring-inset ring-stone-300 rounded px-1.5 py-0.5">
-                                        🐞 {bb.total} bug{bb.total > 1 ? "s" : ""} · resolved
+                                      <span title={`This feature had ${bb.total} linked bug${bb.total > 1 ? "s" : ""}, now all resolved (Approved/Done) — full credit restored. Each bug is its own issue, counted at ${REWORK_PENALTY}×.${others.length ? ` Fixed by ${others.join(", ")}.` : ""}`}
+                                            className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-300 rounded px-1.5 py-0.5">
+                                        ✓ {bb.total} bug{bb.total > 1 ? "s" : ""} fixed{fixBy}
                                       </span>
                                     );
                                   })()}
