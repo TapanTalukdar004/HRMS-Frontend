@@ -962,6 +962,40 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
                   </p>
                 </div>
 
+                {/* ── Weight: priority × story points ── */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">Weight — how much each issue counts</h3>
+                  <p className="text-[12px] text-slate-600 leading-relaxed mb-2">
+                    Status credit answers <i>how far</i>; <b>weight</b> answers <i>how much it matters</i>.
+                    A p0 issue counts twice a p2 of the same size.
+                  </p>
+                  <table className="w-full text-[12px]">
+                    <thead className="text-[10px] uppercase tracking-wider text-slate-400">
+                      <tr><th className="text-left pb-1">priority</th><th className="text-right pb-1">× multiplier</th><th className="text-left pb-1 pl-3">meaning</th></tr>
+                    </thead>
+                    <tbody className="tabular-nums">
+                      {[
+                        ["p0 — urgent", "×2.0", "most critical"],
+                        ["p1 — high", "×1.5", ""],
+                        ["p2 / no-priority", "×1.0", "baseline"],
+                        ["low", "×0.7", "nice-to-have"],
+                      ].map(([p, m, meaning]) => (
+                        <tr key={p as string} className="border-t border-violet-100">
+                          <td className="py-1 pr-2">{p}</td>
+                          <td className="text-right font-bold text-slate-700">{m}</td>
+                          <td className="pl-3 text-slate-500 text-[11px]">{meaning}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+                    <code className="text-[10px] bg-stone-100 px-1 rounded">weight = story points × priority</code>
+                    {" "}(no estimate → 1 SP, row flagged). Each issue&apos;s contribution =
+                    {" "}<b>weight × status-credit</b> (× 0.7 if it&apos;s a bug or was reopened).
+                    <br />Example: a p1 (×1.5), 2-SP issue in QA (78%) → 2 × 1.5 × 0.78 = <b>2.34</b>.
+                  </p>
+                </div>
+
                 {/* ── Bug retention (hold & release) ── */}
                 <div>
                   <h3 className="text-xs uppercase tracking-wider text-slate-500 mb-2">🐞 Bugs &amp; bug-retention</h3>
