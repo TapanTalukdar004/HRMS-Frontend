@@ -6,6 +6,7 @@ import {
   getEmployeeStatusCreditTrend,
   getEmployeeRollup,
   getIssuesForEmployeeByCycle,
+  getEmployeeIssuesMovedAway,
   getHeldFeaturesByCycle,
   currentPeriod,
   periodLabel,
@@ -319,10 +320,11 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
   // the cycle gets a point).  The actual (un-filled) trend powers the
   // snapshot-history TABLE below — that table shows only the days Esha
   // genuinely reported, with real day-over-day deltas.
-  const [issuesByCycle, filledTrend, creditTrend] = await Promise.all([
+  const [issuesByCycle, filledTrend, creditTrend, movedAway] = await Promise.all([
     getIssuesForEmployeeByCycle(name),
     getEmployeeTrendFilled(name),
     getEmployeeStatusCreditTrend(name),
+    getEmployeeIssuesMovedAway(name),
   ]);
   // Bug-retention: cycle-wide held-feature set (a feature with an open linked
   // bug is held at HOLD_CAP). Fetched per team in scope so this page's numbers
@@ -420,6 +422,38 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
           <EmployeeTrendChart data={points} />
         </div>
       </section>
+
+      {/* ─── Moved off this person's board (reassigned to someone else) ─── */}
+      {movedAway.length > 0 && (
+        <section className="mb-6">
+          <div className="rounded-xl border border-amber-200 bg-amber-50/60 overflow-hidden">
+            <div className="px-4 py-3 border-b border-amber-200 flex items-center gap-2">
+              <span className="text-amber-700">↗</span>
+              <h2 className="text-sm font-semibold text-amber-900">
+                Moved off {name}&apos;s board · {movedAway.length} issue{movedAway.length !== 1 ? "s" : ""}
+              </h2>
+              <span className="text-xs text-amber-700/80">— reassigned to someone else (not completed by {name})</span>
+            </div>
+            <div className="divide-y divide-amber-100">
+              {movedAway.map((m) => (
+                <div key={m.issue_id} className="px-4 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
+                  <span className="font-mono text-slate-600">{m.issue_id}</span>
+                  <span className="text-slate-700 flex-1 min-w-[180px] truncate" title={m.title ?? ""}>{m.title ?? "—"}</span>
+                  <span className="text-slate-400 text-xs">was <b className="text-slate-600">{m.was_status ?? "—"}</b> ({m.was_cycle})</span>
+                  <span className="text-amber-700">→</span>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-white ring-1 ring-inset ring-amber-300 px-2 py-0.5">
+                    now with <b className="text-amber-900">{m.now_with}</b>
+                    <span className="text-slate-400">· {m.now_status ?? "—"} · {m.now_cycle}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="px-4 py-2 text-[11px] text-amber-700/70 bg-amber-50">
+              These left {name} and are now scored under their new owner — so they no longer count here. Completed work is not shown (it stays credited to {name}).
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* ─── Issues by cycle — what landed on this person's plate ─── */}
       {issuesByCycle.length > 0 && (

@@ -434,6 +434,60 @@ export async function getIssuesForEmployeeByCycle(
   return order.map(name => byCycle[name]);
 }
 
+export type IssueMovedAway = {
+  issue_id: string;
+  title: string | null;
+  was_status: string | null;     // last status while this employee held it
+  was_cycle: string;             // cycle the employee last held it in
+  now_with: string;              // who currently holds it
+  now_status: string | null;     // its current status
+  now_cycle: string;             // cycle it's currently in
+};
+
+/** Issues this employee USED TO hold that are now held by SOMEONE ELSE —
+ *  i.e. reassigned away (within a cycle OR carried to a new cycle under a new
+ *  owner). Completed work stays with the finisher, so it never appears here;
+ *  only genuine hand-offs do. This gives the "where did my issue go?" trace
+ *  the per-employee view otherwise hides. */
+export async function getEmployeeIssuesMovedAway(
+  employeeName: string,
+): Promise<IssueMovedAway[]> {
+  return await q<IssueMovedAway>(
+    `
+    WITH all_rows AS (
+      SELECT pc.cycle_name,
+             COALESCE(pc.snapshot_at, pc.received_at) AS snap,
+             cei.issue_id, cei.employee_name, cei.title, cei.status
+      FROM cycle_employee_issues cei
+      JOIN performance_cycles pc ON pc.id = cei.cycle_id
+      WHERE pc.source LIKE 'linear%'
+    ),
+    -- the globally-latest holder of each issue (across all cycles/snapshots)
+    global_holder AS (
+      SELECT DISTINCT ON (issue_id)
+        issue_id, employee_name AS holder, cycle_name AS now_cycle, status AS now_status
+      FROM all_rows
+      ORDER BY issue_id, snap DESC
+    ),
+    -- the last state THIS employee held each issue in
+    emp_last AS (
+      SELECT DISTINCT ON (issue_id)
+        issue_id, title, status AS was_status, cycle_name AS was_cycle
+      FROM all_rows
+      WHERE employee_name = $1
+      ORDER BY issue_id, snap DESC
+    )
+    SELECT e.issue_id, e.title, e.was_status, e.was_cycle,
+           g.holder AS now_with, g.now_status, g.now_cycle
+    FROM emp_last e
+    JOIN global_holder g ON g.issue_id = e.issue_id
+    WHERE g.holder <> $1 AND g.holder <> 'unassigned'
+    ORDER BY e.was_cycle DESC, e.issue_id
+    `,
+    [employeeName],
+  );
+}
+
 /** Cross-snapshot, REASSIGNMENT-AWARE view of a cycle's issues.
  *
  *  Two problems this solves at once:
