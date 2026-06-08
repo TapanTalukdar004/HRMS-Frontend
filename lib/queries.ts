@@ -344,15 +344,28 @@ export async function getIssuesForEmployeeByCycle(
     cycle_end: string | null;
   }>(
     `
-    WITH all_rows AS (
+    WITH raw_rows AS (
       -- ALL employees (not filtered) — needed to find the global holder.
       SELECT
         pc.cycle_name, pc.team,
         pc.cycle_start, pc.cycle_end,
+        pc.source,
         COALESCE(pc.snapshot_at, pc.received_at) AS snap,
         cei.*
       FROM cycle_employee_issues cei
       JOIN performance_cycles pc ON pc.id = cei.cycle_id
+    ),
+    cyc_has_linear AS (
+      -- which (team, cycle) have any Linear data
+      SELECT DISTINCT team, cycle_name FROM raw_rows WHERE source LIKE 'linear%'
+    ),
+    all_rows AS (
+      -- SOURCE PREFERENCE: if a cycle has Linear data, use ONLY Linear rows
+      -- (drop the old Esha snapshots); otherwise keep what we have. This makes
+      -- the personal page agree with the team/cycle pages (no Esha/Linear mix).
+      SELECT a.* FROM raw_rows a
+      LEFT JOIN cyc_has_linear h ON h.team = a.team AND h.cycle_name = a.cycle_name
+      WHERE h.cycle_name IS NULL OR a.source LIKE 'linear%'
     ),
     global_holder AS (
       -- Who CURRENTLY holds each (cycle, issue) — the globally-latest row.
