@@ -259,6 +259,36 @@ export async function listSnapshotsForCycle(team: string, cycleName: string): Pr
   `, [team, cycleName]);
 }
 
+export type TeamSnapshotRow = SnapshotRow & { cycle_name: string };
+
+/** EVERY snapshot across ALL cycles for a team (source-preferred per cycle),
+ *  chronological. Feeds the date picker so you can time-travel across cycle
+ *  boundaries — pick any saved date and the dashboard renders as of that day. */
+export async function listSnapshotsForTeam(team: string): Promise<TeamSnapshotRow[]> {
+  return await q<TeamSnapshotRow>(`
+    SELECT
+      pc.id AS cycle_id,
+      pc.cycle_name,
+      pc.received_at::text,
+      COALESCE(pc.snapshot_at, pc.received_at)::text AS snapshot_at,
+      pc.cycle_start::text,
+      pc.cycle_end::text,
+      pc.n_employees, pc.n_high, pc.n_mid, pc.n_low,
+      NULLIF(pc.parsed_payload::jsonb ->> 'days_left', '')::int AS days_left
+    FROM performance_cycles pc
+    WHERE pc.team = $1
+      AND (
+        pc.source LIKE 'linear%'
+        OR NOT EXISTS (
+          SELECT 1 FROM performance_cycles _pl
+          WHERE _pl.team = pc.team AND _pl.cycle_name = pc.cycle_name
+            AND _pl.source LIKE 'linear%'
+        )
+      )
+    ORDER BY COALESCE(pc.snapshot_at, pc.received_at) ASC
+  `, [team]);
+}
+
 // ─── v3 per-issue queries (migration 019) ────────────────────────────────
 
 /** One row from cycle_employee_issues, ready to feed into issueScoring.ts.

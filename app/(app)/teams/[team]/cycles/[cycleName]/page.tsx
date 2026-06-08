@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   listSnapshotsForCycle,
+  listSnapshotsForTeam,
   getCycleIssuesByEmployee,
   getCycleIssuesAcrossSnapshots,
   getCyclePreviousSnapshotChanges,
@@ -357,11 +358,15 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
   const teamCard = allTeams.find((t) => t.team === team);
   if (!teamCard) return notFound();
 
-  // All snapshots for this team+cycle (date picker source)
-  const snapshots = await listSnapshotsForCycle(team, cycleName);
+  // Snapshots for THIS cycle (drives "selected") + ALL team snapshots across
+  // cycles (drives the time-travel date picker — pick any saved date).
+  const [snapshots, allSnapshots] = await Promise.all([
+    listSnapshotsForCycle(team, cycleName),
+    listSnapshotsForTeam(team),
+  ]);
   if (snapshots.length === 0) return notFound();
 
-  // Selected snapshot: from ?snapshot=<id>, defaulting to the LATEST
+  // Selected snapshot: from ?snapshot=<id>, defaulting to the LATEST of THIS cycle.
   const selectedSnapshotId = sp.snapshot ?? snapshots[snapshots.length - 1].cycle_id;
   const selected = snapshots.find((s) => s.cycle_id === selectedSnapshotId)
                  ?? snapshots[snapshots.length - 1];
@@ -714,16 +719,20 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
           Choose a date to view employee progress
         </h2>
         <SnapshotDatePicker
-          options={snapshots.map((s, i) => ({
+          options={allSnapshots.map((s, i) => ({
             id: s.cycle_id,
             snapshot_at: s.snapshot_at,
             days_left: s.days_left,
-            is_current: i === snapshots.length - 1,
+            is_current: i === allSnapshots.length - 1,
+            cycle_name: s.cycle_name,
           }))}
           selectedId={selected.cycle_id}
+          team={team}
+          currentCycleName={cycleName}
         />
         <p className="mt-2 text-xs text-slate-400">
-          {snapshots.length} snapshot{snapshots.length !== 1 ? "s" : ""} on record. The current snapshot is selected by default.
+          {allSnapshots.length} snapshot{allSnapshots.length !== 1 ? "s" : ""} on record across all cycles —
+          pick any date (or use ← Prev / Next →) to see the dashboard as it was that day.
         </p>
       </section>
 

@@ -8,38 +8,53 @@ export type SnapshotOption = {
   snapshot_at: string;   // ISO timestamp
   days_left: number | null;
   is_current: boolean;
+  cycle_name?: string;   // when set, the picker can jump ACROSS cycles
 };
 
 export function SnapshotDatePicker({
   options,
   selectedId,
+  team,
+  currentCycleName,
 }: {
   options: SnapshotOption[];
   selectedId: string;
+  team?: string;             // needed to build cross-cycle URLs
+  currentCycleName?: string; // the cycle this page is currently showing
 }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [isPending, startTransition] = useTransition();
 
+  // multiple cycles present → label each date with its cycle
+  const multiCycle = new Set(options.map((o) => o.cycle_name).filter(Boolean)).size > 1;
+
   const formatLabel = (o: SnapshotOption) => {
     const d = new Date(o.snapshot_at);
     const datePart = d.toLocaleDateString(undefined, {
       weekday: "short", day: "numeric", month: "short", year: "numeric",
     });
+    const cyclePart = multiCycle && o.cycle_name ? `${o.cycle_name}  ·  ` : "";
     const daysSuffix =
       o.days_left === null ? "" :
       o.days_left === 0 ? "  ·  END OF CYCLE" :
       `  ·  ${o.days_left} day${o.days_left !== 1 ? "s" : ""} left`;
-    const currentTag = o.is_current ? "  ·  current" : "";
-    return `${datePart}${daysSuffix}${currentTag}`;
+    const currentTag = o.is_current ? "  ·  latest" : "";
+    return `${cyclePart}${datePart}${daysSuffix}${currentTag}`;
   };
 
   const navigate = (id: string) => {
+    const opt = options.find((o) => o.id === id);
     const params = new URLSearchParams(searchParams);
     params.set("snapshot", id);
+    // If the chosen date belongs to a DIFFERENT cycle, jump to that cycle's page.
+    let target = pathname;
+    if (team && opt?.cycle_name && currentCycleName && opt.cycle_name !== currentCycleName) {
+      target = `/teams/${encodeURIComponent(team)}/cycles/${encodeURIComponent(opt.cycle_name)}`;
+    }
     startTransition(() => {
-      router.push(`${pathname}?${params.toString()}`);
+      router.push(`${target}?${params.toString()}`);
     });
   };
 
