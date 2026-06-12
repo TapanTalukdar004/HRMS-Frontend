@@ -8,6 +8,7 @@ import { Logo } from "./Logo";
 import {
   TeamsIcon, EmployeesIcon, FileTextIcon, ScrollIcon,
   AwardIcon, BotIcon, SettingsIcon, ChevronLeftIcon, ChevronRightIcon, MapIcon,
+  FlaskIcon,
 } from "./icons";
 
 type IconComp = ComponentType<SVGProps<SVGSVGElement> & { size?: number }>;
@@ -44,6 +45,12 @@ const NAV: NavSection[] = [
     title: "HR",
     items: [
       { href: "/policies", label: "Policies", Icon: SettingsIcon },
+    ],
+  },
+  {
+    title: "Lab",
+    items: [
+      { href: "/lab", label: "Agent Lab", Icon: FlaskIcon },
     ],
   },
 ];
