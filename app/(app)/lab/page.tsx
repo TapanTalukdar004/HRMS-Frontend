@@ -2,6 +2,7 @@ import {
   getLabData, finalScore, LAB_REPO,
   type LabIssue, type LabEvidence, type LabAssessment, type LabPr, type ScoreParts,
 } from "@/lib/labQueries";
+import { ReprocessButton } from "@/components/ReprocessButton";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -216,11 +217,14 @@ function ProofColumn({ evidence, linkedPrs }: { evidence: LabEvidence | null; li
   );
 }
 
-function VerdictColumn({ assessment }: { assessment: LabAssessment | null }) {
+function VerdictColumn({ assessment, issueKey }: { assessment: LabAssessment | null; issueKey: string }) {
   if (!assessment) {
     return (
       <div className="p-5">
-        <SectionLabel>Agent verdict</SectionLabel>
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <SectionLabel>Agent verdict</SectionLabel>
+          <ReprocessButton issueKey={issueKey} />
+        </div>
         <div className="text-sm text-slate-400 italic">Not yet judged.</div>
       </div>
     );
@@ -241,7 +245,10 @@ function VerdictColumn({ assessment }: { assessment: LabAssessment | null }) {
   const hasDetail = (assessment.truthfulness_flags?.length ?? 0) > 0 || nDefects > 0;
   return (
     <div className="p-5">
-      <SectionLabel>Agent verdict</SectionLabel>
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <SectionLabel>Agent verdict</SectionLabel>
+        <ReprocessButton issueKey={issueKey} />
+      </div>
       <div className="flex items-center gap-2.5 mb-1.5 flex-wrap">
         <div className="text-2xl font-semibold text-slate-900">
           {q !== null ? q.toFixed(1) : "—"}
@@ -517,7 +524,7 @@ export default async function LabPage() {
                 <div className="grid grid-cols-1 lg:grid-cols-3 divide-y lg:divide-y-0 lg:divide-x divide-stone-100">
                   <ClaimColumn issue={issue} />
                   <ProofColumn evidence={ev} linkedPrs={linkedPrsFor(issue, ev)} />
-                  <VerdictColumn assessment={assessment} />
+                  <VerdictColumn assessment={assessment} issueKey={issue.issue_key} />
                 </div>
                 <ScoreStrip parts={parts} />
               </div>

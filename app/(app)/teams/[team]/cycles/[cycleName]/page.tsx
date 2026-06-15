@@ -713,6 +713,106 @@ export default async function CycleDetailPage({ params, searchParams }: Props) {
         );
       })()}
 
+      {/* ─── Needs attention — actionable data-quality issues ───────────── */}
+      {/* Lists issues from THIS cycle's real data that break fair scoring:
+          missing story points (can't weight the work) and missing priority
+          (can't multiply correctly). Both need a PM fix. Built from the
+          issues already loaded on the page (issuesByEmployee) — no new DB
+          hit. Missing-SP rows come first. Hidden entirely when clean. */}
+      {hasV3Data && (() => {
+        // An issue's priority is "missing" when the raw field is absent or
+        // blank — same as the "—" the priority badge shows. (The scorer
+        // defaults unknown priority to p2, which silently hides the gap.)
+        const hasPriority = (i: { priority?: string | null }) =>
+          !!(i.priority && i.priority.trim());
+
+        type Flag = {
+          issue_id: string;
+          title: string | null;
+          owner: string;
+          kind: "sp" | "priority";
+        };
+        const flags: Flag[] = [];
+        for (const [owner, issues] of Object.entries(issuesByEmployee)) {
+          for (const it of issues) {
+            // Skip excluded issues (canceled/duplicate) — fixing their
+            // metadata is pointless since they don't count toward scoring.
+            if (statusCredit(it) === null) continue;
+            if (!hasSpEstimate(it)) {
+              flags.push({ issue_id: it.issue_id, title: it.title, owner, kind: "sp" });
+            }
+            if (!hasPriority(it)) {
+              flags.push({ issue_id: it.issue_id, title: it.title, owner, kind: "priority" });
+            }
+          }
+        }
+        if (flags.length === 0) return null;
+
+        // Missing-SP first, then missing-priority; stable within each group.
+        const order: Record<Flag["kind"], number> = { sp: 0, priority: 1 };
+        flags.sort((a, b) => order[a.kind] - order[b.kind]);
+
+        const truncate = (s: string | null, n = 60) =>
+          !s ? "(untitled)" : s.length > n ? s.slice(0, n - 1) + "…" : s;
+        const nSp = flags.filter(f => f.kind === "sp").length;
+        const nPri = flags.filter(f => f.kind === "priority").length;
+
+        return (
+          <section className="mb-10">
+            <div className="bg-gradient-to-br from-amber-50/60 via-white to-amber-50/30 border border-amber-200 rounded-2xl p-5">
+              <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-amber-700">
+                  Needs attention
+                  <span className="ml-2 inline-block text-[11px] bg-amber-100 text-amber-800 ring-1 ring-inset ring-amber-200 rounded-full px-2 py-0.5 normal-case tracking-normal font-semibold tabular-nums">
+                    {flags.length}
+                  </span>
+                </h2>
+                <span className="text-xs text-slate-500 tabular-nums">
+                  {nSp} missing SP · {nPri} missing priority
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 mb-3">
+                These issues break fair scoring — a missing estimate or priority
+                distorts the weighted completion %. Ask the PM to fill them in.
+              </p>
+              <ul className="space-y-1.5">
+                {flags.slice(0, 12).map((f, i) => (
+                  <li
+                    key={`${f.issue_id}-${f.kind}-${i}`}
+                    className="flex items-center gap-2 text-sm bg-white border border-amber-100 rounded-lg px-3 py-2"
+                  >
+                    <span className="font-mono text-[11px] text-slate-500 tabular-nums flex-none">
+                      {f.issue_id}
+                    </span>
+                    <span className="text-slate-800 flex-1 truncate" title={f.title ?? undefined}>
+                      {truncate(f.title)}
+                    </span>
+                    <span className="text-[11px] text-slate-500 flex-none hidden sm:inline truncate max-w-[8rem]">
+                      {f.owner}
+                    </span>
+                    <span
+                      className={`inline-block text-[10px] rounded-full px-2 py-0.5 ring-1 ring-inset flex-none ${
+                        f.kind === "sp"
+                          ? "bg-amber-50 text-amber-700 ring-amber-200"
+                          : "bg-violet-50 text-violet-700 ring-violet-200"
+                      }`}
+                    >
+                      {f.kind === "sp" ? "ask PM to add story points" : "ask PM to set priority"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {flags.length > 12 && (
+                <p className="text-[11px] text-amber-700/80 mt-2 font-medium">
+                  + {flags.length - 12} more — these {nSp} missing-SP and {nPri} missing-priority gaps
+                  are the biggest data-quality fix for this cycle.
+                </p>
+              )}
+            </div>
+          </section>
+        );
+      })()}
+
       {/* Snapshot date picker */}
       <section className="mb-8">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-500 mb-3">
