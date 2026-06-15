@@ -234,14 +234,11 @@ function VerdictColumn({ assessment }: { assessment: LabAssessment | null }) {
     : q >= 5 ? { word: "Mixed", cls: "bg-amber-50 text-amber-800 ring-amber-200" }
     : { word: "Needs work", cls: "bg-rose-50 text-rose-700 ring-rose-200" };
   const nDefects = assessment.defects_found?.length ?? 0;
-  const firstSentence = assessment.narrative
-    ? (assessment.narrative.split(/(?<=\.)\s/)[0] || assessment.narrative).slice(0, 140)
-    : null;
-  // the one-liner: lead with defects if any, else the gist
-  const oneLiner = nDefects > 0
-    ? `${nDefects} issue${nDefects > 1 ? "s" : ""} found · covers ${pct(assessment.covers_requirement)}`
-    : firstSentence;
-  const hasDetail = (assessment.truthfulness_flags?.length ?? 0) > 0 || nDefects > 0 || !!assessment.narrative;
+  // the narrative IS the plain-language "why this score" (kept short by the agent)
+  const oneLiner = assessment.narrative
+    ? assessment.narrative.slice(0, 240)
+    : (nDefects > 0 ? `${nDefects} issue${nDefects > 1 ? "s" : ""} found` : null);
+  const hasDetail = (assessment.truthfulness_flags?.length ?? 0) > 0 || nDefects > 0;
   return (
     <div className="p-5">
       <SectionLabel>Agent verdict</SectionLabel>
@@ -282,9 +279,6 @@ function VerdictColumn({ assessment }: { assessment: LabAssessment | null }) {
               <ul className="space-y-0.5 text-[11px] text-slate-600 list-disc list-inside">
                 {assessment.defects_found!.map((d, i) => (<li key={i}>{d}</li>))}
               </ul>
-            )}
-            {assessment.narrative && (
-              <p className="text-[11px] text-slate-600 leading-relaxed">{assessment.narrative}</p>
             )}
             <div className="text-[10px] text-slate-400">
               run {assessment.run_date}
