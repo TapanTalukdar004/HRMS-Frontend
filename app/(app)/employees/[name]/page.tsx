@@ -627,60 +627,73 @@ async function CycleView({ name, fullTrend, cycleFilter, daysShown }: {
                           (open linked bug) caps at 78%; a <b className="text-rose-700">🐞 bug</b> counts at {REWORK_PENALTY}×.
                           Score = total earned ÷ total weight.
                         </p>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-[11.5px] tabular-nums">
-                            <thead className="text-[9px] uppercase tracking-wider text-slate-400 text-left">
-                              <tr>
-                                <th className="py-1 pr-2">Issue</th><th className="py-1 pr-2">Status</th>
-                                <th className="py-1 pr-2 text-right">Weight</th>
-                                <th className="py-1 pr-2 text-right">Credit</th>
-                                <th className="py-1 text-right">Earned</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {[...c.issues]
-                                .map(it => {
-                                  const cr = statusCredit(it);
-                                  const w = computeWeight(it);
-                                  // effective credit = same hold + corrective the score uses
-                                  let eff = cr;
-                                  const heldHere = cr !== null && !isBug(it)
-                                    && heldForCycle.has(it.issue_id) && cr > HOLD_CAP;
-                                  if (cr !== null) {
-                                    eff = heldHere ? HOLD_CAP : cr;
-                                    if (isCorrective(it)) eff = eff * REWORK_PENALTY;
-                                  }
-                                  return { it, cr, eff, w, heldHere,
-                                           earned: cr === null ? 0 : w * (eff as number) };
-                                })
-                                .sort((a, b) => b.earned - a.earned)
-                                .map(({ it, cr, eff, w, heldHere, earned }) => (
-                                  <tr key={it.issue_id} className="border-t border-stone-100">
-                                    <td className="py-1 pr-2 font-mono text-[10.5px] text-slate-600">
-                                      {it.issue_id}
-                                      {heldHere && <span title="held — open linked bug" className="ml-1">🛡</span>}
-                                      {isBug(it) && <span title={`bug · ${REWORK_PENALTY}×`} className="ml-1">🐞</span>}
-                                      {!isBug(it) && !heldHere && bugParents.get(it.issue_id) && (
-                                        <span title={`Had ${bugParents.get(it.issue_id)!.total} linked bug(s), all resolved — full credit restored.`}
-                                              className="ml-1 text-stone-400">🐞✓</span>
-                                      )}
-                                    </td>
-                                    <td className="py-1 pr-2 text-slate-600">{cr === null ? "excluded" : it.status}</td>
-                                    <td className="py-1 pr-2 text-right text-slate-500">{w}</td>
-                                    <td className="py-1 pr-2 text-right text-slate-500">{cr === null ? "—" : `${Math.round((eff as number) * 100)}%`}</td>
-                                    <td className="py-1 text-right font-medium text-slate-800">{cr === null ? "—" : earned.toFixed(2)}</td>
-                                  </tr>
-                                ))}
-                            </tbody>
-                            <tfoot>
-                              <tr className="border-t-2 border-violet-200 font-semibold">
-                                <td className="py-1.5" colSpan={2}>Total → score</td>
-                                <td className="py-1.5 text-right">{score.weightTotal}</td>
-                                <td></td>
-                                <td className="py-1.5 text-right text-violet-700">{score.weightDone} = {pctStr}</td>
-                              </tr>
-                            </tfoot>
-                          </table>
+                        {/* Per-issue scorecard: each issue is its own row showing
+                            label · SP · status · the EARNED score, and unfolds to
+                            show exactly how that score was calculated. */}
+                        <div className="rounded-lg border border-stone-200 overflow-hidden">
+                          {[...c.issues]
+                            .map(it => {
+                              const cr = statusCredit(it);
+                              const w = computeWeight(it);
+                              let eff = cr;
+                              const heldHere = cr !== null && !isBug(it)
+                                && heldForCycle.has(it.issue_id) && cr > HOLD_CAP;
+                              if (cr !== null) {
+                                eff = heldHere ? HOLD_CAP : cr;
+                                if (isCorrective(it)) eff = eff * REWORK_PENALTY;
+                              }
+                              const pm = it.priority === "p0" ? 2.0 : it.priority === "p1" ? 1.5
+                                       : it.priority === "low" ? 0.7 : 1.0;
+                              const spShown = hasSpEstimate(it) ? Number(it.story_points) : 1;
+                              return { it, cr, eff, w, heldHere, pm, spShown,
+                                       earned: cr === null ? 0 : w * (eff as number) };
+                            })
+                            .sort((a, b) => b.earned - a.earned)
+                            .map(({ it, cr, eff, w, heldHere, pm, spShown, earned }) => {
+                              const bug = isBug(it);
+                              const labelCls = bug ? "bg-rose-50 text-rose-700 ring-rose-200"
+                                                   : "bg-sky-50 text-sky-700 ring-sky-200";
+                              return (
+                                <details key={it.issue_id} className="border-t border-stone-100 first:border-t-0 group">
+                                  <summary className="cursor-pointer list-none px-3 py-2 flex items-center gap-2 hover:bg-violet-50/30 select-none text-[12px]">
+                                    <span className="text-slate-300 text-[10px] group-open:rotate-90 transition-transform">▶</span>
+                                    <span className={`text-[9px] font-bold uppercase rounded px-1 py-0.5 ring-1 ring-inset ${labelCls}`}>
+                                      {bug ? "bug" : (it.issue_type || "feat")}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-slate-500">{it.issue_id}</span>
+                                    <span className="flex-1 min-w-0 truncate text-slate-700" title={it.title ?? ""}>{it.title ?? "—"}</span>
+                                    {heldHere && <span title="held — open linked bug">🛡</span>}
+                                    <span className="text-[10px] text-slate-400 tabular-nums hidden sm:inline">{spShown} SP</span>
+                                    <span className="text-[10px] text-slate-500 max-w-[110px] truncate">{cr === null ? "excluded" : it.status}</span>
+                                    <span className="w-14 text-right font-semibold text-violet-700 tabular-nums">
+                                      {cr === null ? "—" : earned.toFixed(2)}
+                                    </span>
+                                  </summary>
+                                  <div className="px-3 pb-2.5 pl-9 text-[11px] text-slate-600 leading-relaxed bg-stone-50/40">
+                                    {cr === null ? (
+                                      <span>Excluded from scoring (canceled / duplicate).</span>
+                                    ) : (
+                                      <>
+                                        <span className="font-mono">
+                                          weight = {spShown} SP × {pm.toFixed(1)} ({it.priority || "p2"}) = <b>{w}</b>
+                                          {"  ·  "}status “{it.status}” = {Math.round((cr as number) * 100)}%
+                                          {heldHere && <> {"  ·  "}held → <b>78%</b> (open linked bug)</>}
+                                          {isCorrective(it) && <> {"  ·  "}bug ×{REWORK_PENALTY}</>}
+                                          {"  ·  "}= earned <b className="text-violet-700">{earned.toFixed(2)}</b>
+                                        </span>
+                                        {!bug && !heldHere && bugParents.get(it.issue_id) && (
+                                          <div className="text-stone-400 mt-0.5">🐞✓ had {bugParents.get(it.issue_id)!.total} linked bug(s), all resolved — full credit restored.</div>
+                                        )}
+                                      </>
+                                    )}
+                                  </div>
+                                </details>
+                              );
+                            })}
+                          <div className="border-t-2 border-violet-200 px-3 py-2 flex items-center justify-between bg-violet-50/40 text-[12px] font-semibold">
+                            <span className="text-slate-600">Total → score</span>
+                            <span className="text-violet-700 tabular-nums">{score.weightDone} ÷ {score.weightTotal} = {pctStr}</span>
+                          </div>
                         </div>
                         <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
                           HR/PM: this is exactly what the score is built from. If an issue&apos;s long pending
