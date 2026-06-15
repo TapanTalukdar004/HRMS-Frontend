@@ -426,6 +426,29 @@ export default async function LabPage() {
       .filter((p): p is LabPr => p !== undefined);
   };
 
+  // ── Needs-attention inbox: only the items a human must act on ──
+  type Att = { issue: LabIssue; sev: "high" | "med"; reason: string };
+  const attention: Att[] = [];
+  for (const issue of sorted) {
+    const ev = evidenceByIssue[issue.issue_key] ?? null;
+    const a = assessmentByIssue[issue.issue_key] ?? null;
+    if (ev?.bucket === "unproven")
+      attention.push({ issue, sev: "high", reason: "Marked Done but no merged PR — verify" });
+    if (ev?.bucket === "untracked")
+      attention.push({ issue, sev: "med", reason: "Code merged but Linear not updated — advance the status" });
+    const lowQ = a && a.code_quality !== null && a.code_quality < 5;
+    if (lowQ)
+      attention.push({ issue, sev: "high", reason: `Low quality (${a!.code_quality!.toFixed(1)}/10) — review` });
+    const nd = a?.defects_found?.length ?? 0;
+    if (nd > 0 && !lowQ)
+      attention.push({ issue, sev: "high", reason: `${nd} possible defect${nd > 1 ? "s" : ""} — review` });
+    if (issue.estimate === null || issue.estimate === undefined)
+      attention.push({ issue, sev: "med", reason: "No story points — ask the PM to add" });
+    if (!issue.priority || issue.priority === "none")
+      attention.push({ issue, sev: "med", reason: "No priority — ask the PM to set" });
+  }
+  attention.sort((x, y) => (x.sev === y.sev ? 0 : x.sev === "high" ? -1 : 1));
+
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
       {/* Header */}
@@ -465,6 +488,26 @@ export default async function LabPage() {
         <EmptyState />
       ) : (
         <div className="space-y-5">
+          {/* Needs-attention inbox — the only items that need a human */}
+          {attention.length > 0 && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50/50 overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-amber-200 flex items-center gap-2 flex-wrap">
+                <span className="text-amber-700">⚑</span>
+                <h2 className="text-sm font-semibold text-amber-900">Needs attention · {attention.length}</h2>
+                <span className="text-[11px] text-amber-700/70">— the only items that need a human; everything else is fine</span>
+              </div>
+              <div className="divide-y divide-amber-100">
+                {attention.map((a, i) => (
+                  <div key={i} className="px-4 py-2 flex items-center gap-3 text-[13px]">
+                    <span className={`shrink-0 w-1.5 h-1.5 rounded-full ${a.sev === "high" ? "bg-rose-500" : "bg-amber-500"}`} />
+                    <span className="font-mono text-[11px] text-slate-500 w-14 shrink-0">{a.issue.issue_key}</span>
+                    <span className="text-slate-700 flex-1 min-w-0">{a.reason}</span>
+                    <span className="text-[11px] text-slate-400 truncate max-w-[220px] hidden sm:block" title={a.issue.title ?? ""}>{a.issue.title}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {sorted.map((issue) => {
             const ev = evidenceByIssue[issue.issue_key] ?? null;
             const assessment = assessmentByIssue[issue.issue_key] ?? null;
