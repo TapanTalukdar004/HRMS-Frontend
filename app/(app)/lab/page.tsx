@@ -225,52 +225,75 @@ function VerdictColumn({ assessment }: { assessment: LabAssessment | null }) {
       </div>
     );
   }
+  // SHORT, scannable verdict: a one-word label + one-line summary up top;
+  // the full flags / defects / narrative are tucked behind "Details ▾" so the
+  // card stays clean. Anyone can glance the headline, click to dig in.
+  const q = assessment.code_quality;
+  const verdict = q === null ? { word: "Not judged", cls: "bg-stone-100 text-stone-500" }
+    : q >= 7 ? { word: "Solid", cls: "bg-emerald-50 text-emerald-700 ring-emerald-200" }
+    : q >= 5 ? { word: "Mixed", cls: "bg-amber-50 text-amber-800 ring-amber-200" }
+    : { word: "Needs work", cls: "bg-rose-50 text-rose-700 ring-rose-200" };
+  const nDefects = assessment.defects_found?.length ?? 0;
+  const firstSentence = assessment.narrative
+    ? (assessment.narrative.split(/(?<=\.)\s/)[0] || assessment.narrative).slice(0, 140)
+    : null;
+  // the one-liner: lead with defects if any, else the gist
+  const oneLiner = nDefects > 0
+    ? `${nDefects} issue${nDefects > 1 ? "s" : ""} found · covers ${pct(assessment.covers_requirement)}`
+    : firstSentence;
+  const hasDetail = (assessment.truthfulness_flags?.length ?? 0) > 0 || nDefects > 0 || !!assessment.narrative;
   return (
     <div className="p-5">
       <SectionLabel>Agent verdict</SectionLabel>
-      <div className="flex items-baseline gap-3 mb-2 flex-wrap">
+      <div className="flex items-center gap-2.5 mb-1.5 flex-wrap">
         <div className="text-2xl font-semibold text-slate-900">
-          {assessment.code_quality !== null ? assessment.code_quality.toFixed(1) : "—"}
+          {q !== null ? q.toFixed(1) : "—"}
           <span className="text-sm font-normal text-slate-400">/10</span>
         </div>
-        <div className="text-xs text-slate-500">
-          covers requirement{" "}
-          <span className="font-medium text-slate-700">{pct(assessment.covers_requirement)}</span>
-        </div>
-        <div className="text-xs text-slate-500">
-          confidence{" "}
-          <span className="font-medium text-slate-700">{pct(assessment.confidence)}</span>
-        </div>
+        <span className={`text-[11px] font-semibold rounded-full px-2 py-0.5 ring-1 ring-inset ${verdict.cls}`}>
+          {verdict.word}
+        </span>
+        {nDefects > 0 && (
+          <span className="text-[11px] font-medium text-rose-600">🐞 {nDefects}</span>
+        )}
       </div>
-      {assessment.truthfulness_flags && assessment.truthfulness_flags.length > 0 && (
-        <div className="flex items-center gap-1.5 flex-wrap mb-2">
-          {assessment.truthfulness_flags.map((f, i) => (
-            <span key={i} className="text-[10px] uppercase tracking-wide bg-amber-50 text-amber-800 ring-1 ring-inset ring-amber-200 rounded-full px-1.5 py-0.5">
-              {f.replace(/_/g, " ")}
-            </span>
-          ))}
-        </div>
+      {oneLiner && (
+        <p className={`text-xs leading-snug ${nDefects > 0 ? "text-rose-700" : "text-slate-600"}`}>{oneLiner}</p>
       )}
-      {assessment.defects_found && assessment.defects_found.length > 0 && (
-        <div className="mb-2">
-          <div className="text-[10px] uppercase tracking-wider text-rose-500 font-semibold mb-1">
-            Defects found
+      {hasDetail && (
+        <details className="mt-2 group">
+          <summary className="text-[11px] text-[#AE00D0] cursor-pointer list-none select-none hover:underline">
+            Details ▾
+          </summary>
+          <div className="mt-2 space-y-2 border-l-2 border-stone-100 pl-3">
+            <div className="text-[11px] text-slate-500">
+              covers {pct(assessment.covers_requirement)} · confidence {pct(assessment.confidence)}
+            </div>
+            {assessment.truthfulness_flags && assessment.truthfulness_flags.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {assessment.truthfulness_flags.map((f, i) => (
+                  <span key={i} className="text-[10px] uppercase tracking-wide bg-amber-50 text-amber-800 ring-1 ring-inset ring-amber-200 rounded-full px-1.5 py-0.5">
+                    {f.replace(/_/g, " ")}
+                  </span>
+                ))}
+              </div>
+            )}
+            {nDefects > 0 && (
+              <ul className="space-y-0.5 text-[11px] text-slate-600 list-disc list-inside">
+                {assessment.defects_found!.map((d, i) => (<li key={i}>{d}</li>))}
+              </ul>
+            )}
+            {assessment.narrative && (
+              <p className="text-[11px] text-slate-600 leading-relaxed">{assessment.narrative}</p>
+            )}
+            <div className="text-[10px] text-slate-400">
+              run {assessment.run_date}
+              {assessment.model_version ? ` · ${assessment.model_version}` : ""}
+              {assessment.human_verdict ? ` · human: ${assessment.human_verdict}` : ""}
+            </div>
           </div>
-          <ul className="space-y-0.5 text-[11px] text-slate-600 list-disc list-inside">
-            {assessment.defects_found.map((d, i) => (
-              <li key={i}>{d}</li>
-            ))}
-          </ul>
-        </div>
+        </details>
       )}
-      {assessment.narrative && (
-        <p className="text-xs text-slate-600 leading-relaxed">{assessment.narrative}</p>
-      )}
-      <div className="mt-2 text-[10px] text-slate-400">
-        run {assessment.run_date}
-        {assessment.model_version ? ` · ${assessment.model_version}` : ""}
-        {assessment.human_verdict ? ` · human: ${assessment.human_verdict}` : ""}
-      </div>
     </div>
   );
 }
