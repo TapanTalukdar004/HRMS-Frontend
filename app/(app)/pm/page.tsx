@@ -145,8 +145,16 @@ export default async function PmDeskPage() {
                     <td className="py-1.5 pr-3 font-mono text-[11px] text-emerald-800">{c.issueKey}</td>
                     <td className="py-1.5 pr-3 capitalize text-slate-700">{c.employee ?? "—"}</td>
                     <td className="py-1.5 pr-3 text-slate-500">{c.cycleName ?? "—"}</td>
-                    <td className="py-1.5 pr-3 tabular-nums text-slate-700">{c.oldEstimate ?? "—"} → <b>{c.newEstimate ?? "—"}</b></td>
-                    <td className="py-1.5 pr-3 capitalize text-slate-700">{c.oldPriority ?? "none"} → <b>{c.newPriority ?? "none"}</b></td>
+                    <td className="py-1.5 pr-3 tabular-nums text-slate-700">
+                      {c.kind === "late_linkage"
+                        ? <span className="text-emerald-800 text-[11px]">evidence linked late</span>
+                        : <>{c.oldEstimate ?? "—"} → <b>{c.newEstimate ?? "—"}</b></>}
+                    </td>
+                    <td className="py-1.5 pr-3 capitalize text-slate-700">
+                      {c.kind === "late_linkage"
+                        ? <span className="text-slate-400 text-[11px]">PR gained its issue key</span>
+                        : <>{c.oldPriority ?? "none"} → <b>{c.newPriority ?? "none"}</b></>}
+                    </td>
                     <td className="py-1.5 pr-3 tabular-nums text-slate-700">{c.oldScore ?? "—"} → <b>{c.newScore ?? "—"}</b>/100</td>
                     <td className="py-1.5 text-right text-slate-400 whitespace-nowrap">{dmy(c.detectedAt)}</td>
                   </tr>

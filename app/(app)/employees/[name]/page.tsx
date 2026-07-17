@@ -10,7 +10,8 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { accountFor, AUTH_COOKIE } from "@/lib/auth";
-import { getEmployeeReports, applyPersistedScores, getCycleContext, getCarryoverIssues, getMonthlyScore, getCycleHistory, REAL_REPO, type CycleHistoryRow } from "@/lib/realReport";
+import { getEmployeeReports, applyPersistedScores, getCycleContext, getCarryoverIssues, getMonthlyScore, getCycleHistory, getUntrackedPrs, REAL_REPO, type CycleHistoryRow } from "@/lib/realReport";
+import UntrackedPrs from "@/components/UntrackedPrs";
 import CarryoverSection from "@/components/CarryoverSection";
 import ScoreScopeTabs from "@/components/ScoreScopeTabs";
 import CycleHistory from "@/components/CycleHistory";
@@ -55,13 +56,14 @@ export default async function EmployeeDetailPage({ params }: Props) {
   const nowISO = new Date().toISOString();
   // Everything below is independent of `reports`, so run it all in ONE Promise.all instead of 5 serial
   // awaits (changes/233 perf) — the page no longer waits on a chain of pooler round-trips.
-  const [reports0, roster, daily, carryover, monthly, cycleHistory] = await Promise.all([
+  const [reports0, roster, daily, carryover, monthly, cycleHistory, untracked] = await Promise.all([
     getEmployeeReports(cyc.current),
     listRosterEmployees(),
     getDailyPoints(token),
     getCarryoverIssues(token, cyc.current),   // ongoing work from earlier cycles (shown, not scored)
     getMonthlyScore(token, nowISO),           // absolute monthly rollup + EWMA trend
     getCycleHistory(token),                   // persisted per-cycle score (scored cycles only)
+    getUntrackedPrs(token),                   // PRs with no issue link, window-bounded (changes/241)
   ]);
   const reports = await applyPersistedScores(reports0, cyc.current);   // persisted DB score (fallback: live)
   const r = reports.find((x) => x.employee === token) ?? null;
@@ -149,6 +151,10 @@ export default async function EmployeeDetailPage({ params }: Props) {
           <div className="bg-white rounded-xl border border-stone-200 p-8 text-center text-slate-400 text-[14px]">No issues assigned to {display} in the current window.</div>
         )}
       </div>
+
+      {/* PRs with no issue link (self-service loop, changes/241): visible across ALL collected repos,
+          window-bounded, never scored until the employee adds the issue key and the nightly links it */}
+      <UntrackedPrs items={untracked} subject={display.split(" ")[0]} />
 
       {/* per-PR review + codebase-map graph — only when there are merged PRs to analyse */}
       {hasProof && <EmployeePrAnalysis report={r!} />}

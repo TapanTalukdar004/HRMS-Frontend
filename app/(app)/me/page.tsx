@@ -7,8 +7,9 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { accountFor, AUTH_COOKIE } from "@/lib/auth";
-import { getEmployeeReports, applyPersistedScores, getCycleContext, getCarryoverIssues, getMonthlyScore, getCycleHistory, REAL_REPO } from "@/lib/realReport";
+import { getEmployeeReports, applyPersistedScores, getCycleContext, getCarryoverIssues, getMonthlyScore, getCycleHistory, getUntrackedPrs } from "@/lib/realReport";
 import CarryoverSection from "@/components/CarryoverSection";
+import UntrackedPrs from "@/components/UntrackedPrs";
 import ScoreScopeTabs from "@/components/ScoreScopeTabs";
 import CycleHistory from "@/components/CycleHistory";
 import { getDailyPoints } from "@/lib/overviewQueries";
@@ -40,11 +41,15 @@ export default async function MePage() {
 
   const token = account.employee ?? account.username;
   const cyc = await getCycleContext();   // STRICT current-cycle scope (changes/204) — no prior-cycle leak
-  const [reports0, daily] = await Promise.all([getEmployeeReports(cyc.current), getDailyPoints(token)]);
+  const [reports0, daily, carryover, monthly, cycleHistory, untracked] = await Promise.all([
+    getEmployeeReports(cyc.current),
+    getDailyPoints(token),
+    getCarryoverIssues(token, cyc.current),      // ongoing work from earlier cycles (shown, not scored)
+    getMonthlyScore(token, new Date().toISOString()),  // absolute monthly rollup + EWMA trend
+    getCycleHistory(token),                      // last 3 cycles' score + make-up
+    getUntrackedPrs(token),                      // PRs with no issue link, window-bounded (changes/241)
+  ]);
   const reports = await applyPersistedScores(reports0, cyc.current);   // persisted DB score for the current cycle (fallback: live)
-  const carryover = await getCarryoverIssues(token, cyc.current);      // ongoing work from earlier cycles (shown, not scored)
-  const monthly = await getMonthlyScore(token, new Date().toISOString());   // absolute monthly rollup + EWMA trend
-  const cycleHistory = await getCycleHistory(token);                        // last 3 cycles' score + make-up
   const me = reports.find((r) => r.employee === token) ?? null;
   const display = account.label;
   const initials = display.split(/\s+/).map((p) => p[0]).slice(0, 2).join("").toUpperCase();
@@ -61,12 +66,14 @@ export default async function MePage() {
             <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Hi {display} 👋</h1>
             {hasProof && <span className={`text-[11px] uppercase tracking-wider rounded-full px-2.5 py-0.5 ${bandCls}`}>{bandWord(me!.band)}</span>}
           </div>
-          <p className="text-[13px] text-slate-500 mt-0.5">Your work in <span className="font-medium text-slate-700">{REAL_REPO}</span> · current cycle · advisory — informs a conversation, never an automatic decision</p>
+          <p className="text-[13px] text-slate-500 mt-0.5">Your work across <span className="font-medium text-slate-700">the connected RUH repos</span> · current cycle · advisory — informs a conversation, never an automatic decision</p>
         </div>
       </div>
 
       <div className="rounded-xl border border-amber-200 bg-amber-50/50 px-4 py-3 text-[13px] text-amber-900 leading-snug">
-        <b>This is one repo only.</b> Work you shipped in other repos isn&apos;t counted here yet, so a low number can simply mean &ldquo;not visible yet.&rdquo; You can ask about any score you disagree with below.
+        <b>Only work linked to a Linear issue is scored.</b> If a PR of yours carries no issue key, it appears in the
+        &ldquo;PRs with no issue link&rdquo; list below — add the issue ID to the PR title and tonight&apos;s scan scores it.
+        You can ask about any score you disagree with below.
       </div>
 
       {/* score signature — Cycle (real-time) / Monthly (rollup + trend) / Quarter (soon) */}
@@ -114,6 +121,9 @@ export default async function MePage() {
             <EngineerCard r={me!} defaultOpen carryover={carryover} />
           </div>
 
+          {/* PRs with no issue link — the self-service fix loop (changes/241) */}
+          <UntrackedPrs items={untracked} subject="You" />
+
           {/* evidence analysis + codebase map */}
           <div>
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-500 mb-2">Evidence — per-PR review &amp; where your work reached</h2>
@@ -123,9 +133,11 @@ export default async function MePage() {
       ) : (
         <div className="space-y-4">
           <div className="bg-white rounded-xl border border-stone-200 p-8 text-center">
-            <div className="text-lg font-medium text-slate-800">No scored work in this repo yet</div>
-            <p className="text-[14px] text-slate-500 mt-1">Either your PRs here aren&apos;t linked to a ticket, or your work is in another repo we haven&apos;t connected. This will fill in as more repos are added.</p>
+            <div className="text-lg font-medium text-slate-800">No scored work yet</div>
+            <p className="text-[14px] text-slate-500 mt-1">Your merged PRs aren&apos;t linked to a Linear ticket yet — the list below shows exactly which ones, and adding the issue ID to the PR title fixes it overnight.</p>
           </div>
+          {/* PRs with no issue link — the reason there's no score, made visible + fixable */}
+          <UntrackedPrs items={untracked} subject="You" />
           {/* still surface ongoing carryover even with no scored work this cycle */}
           <CarryoverSection items={carryover} name="you" />
         </div>

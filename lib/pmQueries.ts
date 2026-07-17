@@ -44,6 +44,7 @@ export type ScoreCorrection = {
   oldPriority: string | null; newPriority: string | null;
   oldScore: number | null; newScore: number | null;
   detectedAt: string;
+  kind: "marking" | "late_linkage";   // WHY the frozen cycle re-scored (changes/241)
 };
 
 /** Stale floater (changes/238): still "ongoing" by status, but its merged PRs predate the correctable
@@ -157,9 +158,11 @@ export async function getPmDeskData(): Promise<PmDeskData> {
       q<{ issue_key: string; cycle_name: string | null; employee_name: string | null;
           old_estimate: number | null; new_estimate: number | null;
           old_priority: string | null; new_priority: string | null;
-          old_cycle_score: number | null; new_cycle_score: number | null; detected_at: string }>(
+          old_cycle_score: number | null; new_cycle_score: number | null; detected_at: string;
+          kind: "marking" | "late_linkage" }>(
         `SELECT issue_key, cycle_name, employee_name, old_estimate, new_estimate,
-                old_priority, new_priority, old_cycle_score, new_cycle_score, detected_at
+                old_priority, new_priority, old_cycle_score, new_cycle_score, detected_at,
+                COALESCE(kind, 'marking') AS kind
            FROM score_corrections WHERE workspace = $1
           ORDER BY detected_at DESC LIMIT 12`, [REAL_WORKSPACE]),
     ]);
@@ -225,6 +228,7 @@ export async function getPmDeskData(): Promise<PmDeskData> {
         oldPriority: c.old_priority, newPriority: c.new_priority,
         oldScore: num(c.old_cycle_score), newScore: num(c.new_cycle_score),
         detectedAt: c.detected_at,
+        kind: c.kind,
       })),
       stale,
       currentCycle: maxc,

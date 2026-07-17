@@ -11,8 +11,57 @@
 import { cache } from "react";
 import { q } from "./db";
 
-export const REAL_REPO = "ruh-ai/agent-builder";
+export const REAL_REPO = "ruh-ai/agent-builder";   // primary repo (codebase-map JSON + label fallback)
 export const REAL_WORKSPACE = "ruh";
+export const WORKSPACE_LABEL = "the RUH workspace";
+
+/**
+ * The scoring-repo set (changes/240): every repo whose PRs feed this workspace's scores
+ * (`repo_project_map.scores`). Dashboards read PRs/assessments/blast facts across ALL of them, so an
+ * employee's cross-repo work shows and scores. Falls back to the primary repo if the flag/table is absent.
+ */
+export async function getScoringRepos(): Promise<string[]> {
+  try {
+    const rows = await q<{ repo: string }>("SELECT repo FROM repo_project_map WHERE active AND scores ORDER BY repo");
+    return rows.length ? rows.map((r) => r.repo) : [REAL_REPO];
+  } catch {
+    return [REAL_REPO];
+  }
+}
+
+/** Every collected PR by this employee with NO working issue link, current + previous cycle only
+ *  (changes/241 — the self-service loop: the employee sees exactly which of their PRs aren't tracked,
+ *  adds the issue key to the PR title/branch, and the next nightly run links + scores it).
+ *  Spans ALL active real repos (incl. collect-only ones like sdr), so work is visible even where
+ *  scoring isn't on yet. `external_key` = a key was found but it isn't an issue we hold (other team). */
+export type UntrackedPr = {
+  repo: string; prNumber: number; title: string | null; state: string | null;
+  mergedAt: string | null; status: "untracked" | "external_key"; candidateKeys: string[];
+};
+export async function getUntrackedPrs(token: string): Promise<UntrackedPr[]> {
+  try {
+    const rows = await q<{ repo: string; pr_number: number; title: string | null; state: string | null; merged_at: string | null; link_status: "untracked" | "external_key"; candidate_keys: string[] | null }>(
+      `WITH b AS (
+         SELECT COALESCE(
+                  MIN(cycle_started_at) FILTER (WHERE cycle_number = (SELECT MAX(cycle_number) - 1 FROM lab_linear_issues WHERE workspace = $1 AND cycle_number IS NOT NULL)),
+                  now() - interval '14 days') AS boundary
+           FROM lab_linear_issues WHERE workspace = $1)
+       SELECT l.repo, l.pr_number, p.title, p.state, p.merged_at, l.link_status, l.candidate_keys
+         FROM pr_issue_links l
+         JOIN github_prs p ON p.repo = l.repo AND p.pr_number = l.pr_number
+         JOIN repo_project_map m ON m.repo = l.repo AND m.active AND m.repo LIKE 'ruh-ai/%'
+        WHERE l.link_status IN ('untracked','external_key') AND lower(l.employee_name) = $2
+          AND (p.merged_at >= (SELECT boundary FROM b) OR (p.merged_at IS NULL AND p.state = 'open'))
+        ORDER BY COALESCE(p.merged_at, p.created_at) DESC`,
+      [REAL_WORKSPACE, token.toLowerCase()]);
+    return rows.map((r) => ({
+      repo: r.repo, prNumber: Number(r.pr_number), title: r.title, state: r.state,
+      mergedAt: r.merged_at, status: r.link_status, candidateKeys: r.candidate_keys ?? [],
+    }));
+  } catch {
+    return [];
+  }
+}
 
 const REWORK_PENALTY = 0.7;
 const BUG_RESOLVED = 0.93;
@@ -31,6 +80,7 @@ function blastMult(band: string | null): number { return BLAST_MULT[(band ?? "lo
 
 export type RealIssue = { issue_key: string; title: string | null; status: string | null; priority: string | null; estimate: number | null; assignee: string | null; label: string | null; relates_to: string[] | null; cycle_number: number | null; is_inherited: boolean; cycle_started_at: string | null; cycle_ended_at: string | null; started_at: string | null; completed_at: string | null; added_to_cycle_at: string | null };
 export type RealPr = {
+  repo: string;   // owning repo — pr_number is unique only within a repo (changes/240 multi-repo)
   pr_number: number; title: string | null; state: string | null; merged_at: string | null; head_sha: string | null;
   employee_name: string | null; link_status: string; verified_keys: string[];
   reviews: number; selfMerged: boolean; ci: string | null; adds: number; dels: number; files: number;
@@ -154,6 +204,7 @@ export const getCycleContext = cache(async (): Promise<CycleContext> => {
  *                  linked issue's cycle — changes/173 decision). null = the whole {max,max-1,max-2} window.
  */
 export const getEmployeeReports = cache(async (cycleNum: number | null = null): Promise<EmployeeReport[]> => {
+  const repos = await getScoringRepos();   // multi-repo scoring union (changes/240)
   const [issueRows, prRows, assessRows, clusterRows, impactRows] = await Promise.all([
     q<RealIssue>(`SELECT issue_key, title, status, priority, estimate, assignee, label, relates_to,
                          cycle_number, is_inherited, cycle_started_at, cycle_ended_at,
@@ -163,26 +214,26 @@ export const getEmployeeReports = cache(async (cycleNum: number | null = null): 
                     -- defend the window IN the query too (not only at ingest): current + 2 prior
                     AND cycle_number >= (SELECT MAX(cycle_number) - 2 FROM lab_linear_issues WHERE workspace = $1 AND cycle_number IS NOT NULL)
                     AND ($2::int IS NULL OR cycle_number = $2::int)`, [REAL_WORKSPACE, cycleNum]),
-    q<RealPr>(`SELECT l.pr_number, l.employee_name, l.link_status, l.verified_keys,
+    q<RealPr>(`SELECT l.repo, l.pr_number, l.employee_name, l.link_status, l.verified_keys,
                       p.title, p.state, p.merged_at, p.head_sha,
                       p.review_approvals AS reviews, p.self_merged AS "selfMerged", p.ci_status AS ci,
                       p.additions AS adds, p.deletions AS dels, p.changed_files AS files
                FROM pr_issue_links l JOIN github_prs p ON p.repo = l.repo AND p.pr_number = l.pr_number
-               WHERE l.repo = $1 ORDER BY l.pr_number DESC`, [REAL_REPO]),
+               WHERE l.repo = ANY($1) ORDER BY l.pr_number DESC`, [repos]),
     q<{ issue_key: string; head_sha: string | null; code_quality: number | null; narrative: string | null; strengths: string[] | null; defects_found: string[] | null; covers_requirement: number | null; truthfulness_flags: string[] | null }>(
       `SELECT DISTINCT ON (head_sha, issue_key) issue_key, head_sha, code_quality, narrative, strengths, defects_found, covers_requirement, truthfulness_flags
-       FROM agent_assessments WHERE repo = $1 ORDER BY head_sha, issue_key, created_at DESC`, [REAL_REPO]),
+       FROM agent_assessments WHERE repo = ANY($1) ORDER BY head_sha, issue_key, created_at DESC`, [repos]),
     q<{ issue_key: string; integration_status: string | null; connection_notes: string | null; cross_defects: string[] | null }>(
       `SELECT DISTINCT ON (issue_key) issue_key, integration_status, connection_notes, cross_defects
        FROM issue_cluster ORDER BY issue_key, run_date DESC, created_at DESC`),
-    q<{ pr_number: number; reached_symbols: number | null; blast_band: string | null; touches_sensitive: boolean | null; detail: { changed_modules?: string[]; reached_modules?: string[] } | null }>(
-      `SELECT pr_number, reached_symbols, blast_band, touches_sensitive, detail FROM pr_graph_impact WHERE repo = $1`, [REAL_REPO]),
+    q<{ repo: string; pr_number: number; reached_symbols: number | null; blast_band: string | null; touches_sensitive: boolean | null; detail: { changed_modules?: string[]; reached_modules?: string[] } | null }>(
+      `SELECT repo, pr_number, reached_symbols, blast_band, touches_sensitive, detail FROM pr_graph_impact WHERE repo = ANY($1)`, [repos]),
   ]);
 
   const issues = issueRows.map((r) => ({ ...r, estimate: num(r.estimate), relates_to: r.relates_to ?? [] }));
-  const impactByPr = new Map(impactRows.map((g) => [Number(g.pr_number), g]));
+  const impactByPr = new Map(impactRows.map((g) => [`${g.repo}|${Number(g.pr_number)}`, g]));
   const allPrs = prRows.map((r) => {
-    const g = impactByPr.get(Number(r.pr_number));
+    const g = impactByPr.get(`${r.repo}|${Number(r.pr_number)}`);
     return { ...r, pr_number: Number(r.pr_number), verified_keys: r.verified_keys ?? [], reviews: Number(r.reviews ?? 0), selfMerged: !!r.selfMerged, adds: Number(r.adds ?? 0), dels: Number(r.dels ?? 0), files: Number(r.files ?? 0),
       reachedSymbols: g ? num(g.reached_symbols) : null, blastBand: g?.blast_band ?? null, touchesSensitive: !!g?.touches_sensitive,
       changedModules: g?.detail?.changed_modules ?? [], reachedModules: g?.detail?.reached_modules ?? [] };
