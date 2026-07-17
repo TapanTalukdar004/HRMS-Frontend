@@ -6,12 +6,17 @@ import { Pool, types } from "pg";
 types.setTypeParser(1082, (val: string) => val);
 
 // Cache the pool across hot-reloads in dev (avoids "too many connections")
-const globalForPg = globalThis as unknown as { pgPool?: Pool };
+const globalForPg = globalThis as unknown as { pgPool?: Pool; pgPoolMax?: number };
+
+// /overview fires ~10 queries in one Promise.all wave (changes/236) — max must cover a full
+// wave or the tail queues behind the pool. Supabase's transaction pooler allows far more
+// client connections than this, so 10 is still conservative.
+const POOL_MAX = 10;
 
 function makePool(): Pool {
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    max: 4,
+    max: POOL_MAX,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
   });

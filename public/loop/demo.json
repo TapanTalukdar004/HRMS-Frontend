@@ -1,0 +1,121 @@
+{
+  "generated_at": "2026-07-01T07:05:05.737921+00:00",
+  "note": "DEMO data: full loop (L2) run offline on frozen fixture PRs. Not from the database.",
+  "loop": "L0 (determinism+spotlighting+evidence-cap) -> L1 (self-consistency union vote) -> L2 (diff-grounded verify)",
+  "count": 3,
+  "prs": [
+    {
+      "repo": "OpenListTeam/OpenList-Frontend",
+      "pr_number": 558,
+      "label": "clean / stable",
+      "title": "chore: auto update i18n file",
+      "goal": "PR title: chore: auto update i18n file  (+ Linear issue title in production)",
+      "code_quality": 9.0,
+      "verdict": "clean",
+      "matches_title": true,
+      "confidence": 1.0,
+      "samples_k": 5,
+      "injection_attempt": false,
+      "quality_outlier": false,
+      "verify_dropped": 0,
+      "n_findings": 0,
+      "findings": [],
+      "reached": 0,
+      "touches_sensitive": false
+    },
+    {
+      "repo": "OpenListTeam/OpenList-Frontend",
+      "pr_number": 560,
+      "label": "borderline -> resolved",
+      "title": "feat(previews/text-editor): add toolbar for monaco editor",
+      "goal": "PR title: feat(previews/text-editor): add toolbar for monaco editor  (+ Linear issue title in production)",
+      "code_quality": 8.0,
+      "verdict": "clean",
+      "matches_title": true,
+      "confidence": 1.0,
+      "samples_k": 5,
+      "injection_attempt": false,
+      "quality_outlier": false,
+      "verify_dropped": 0,
+      "n_findings": 0,
+      "findings": [],
+      "reached": 122,
+      "touches_sensitive": false
+    },
+    {
+      "repo": "FlowiseAI/Flowise",
+      "pr_number": 5994,
+      "label": "known real bugs",
+      "title": "Feature/Add Audit and Deletion ",
+      "goal": "PR title: Feature/Add Audit and Deletion   (+ Linear issue title in production)",
+      "code_quality": 7.0,
+      "verdict": "needs-changes",
+      "matches_title": true,
+      "confidence": 1.0,
+      "samples_k": 5,
+      "injection_attempt": false,
+      "quality_outlier": false,
+      "verify_dropped": 0,
+      "n_findings": 5,
+      "findings": [
+        {
+          "type": "bug",
+          "severity": "major",
+          "title": "Stripe subscription cancel runs inside the open DB transaction, risking inconsistent billing/data state and lock contention",
+          "why": "If the Stripe cancel succeeds but the subsequent commit fails, the subscription is cancelled while the account/org data remains; holding a multi-table transaction open across a slow external HTTP call also increases lock contention.",
+          "fix": "In packages/server/src/enterprise/services/account.service.ts delete(), move `await this.identityManager.cancelSubscription(organizaiton.subscriptionId)` to AFTER `await queryRunner.commitTransaction()` (alongside removeFolderFromStorage), so no external network call is made while the transaction is open; handle its failure with compensating logging rather than a rollback of already-committed data.",
+          "evidence": "        // Step 6: Cancel Stripe Subscription\n+        await this.identityManager.cancelSubscription(organizaiton.subscriptionId)\n+\n+        await queryRunner.commitTransaction()",
+          "recurrence": 1,
+          "confidence_runs": "1/5",
+          "verify_why": "Diff confirms 'await this.identityManager.cancelSubscription(...)' executes before 'await queryRunner.commitTransaction()', so the external Stripe cancel runs inside the open multi-table transaction \u2014 a real partial-failure/consistency and lock-contention risk, not a style nit."
+        },
+        {
+          "type": "bug",
+          "severity": "major",
+          "title": "Irreversible Stripe subscription cancellation runs inside the DB transaction before commit, so a commit failure leaves a cancelled subscription on an undeleted account",
+          "why": "cancelSubscription mutates external Stripe state that rollback cannot undo; if commitTransaction throws, the DB deletes roll back but the subscription is already cancelled, leaving billing and account state inconsistent.",
+          "fix": "In packages/server/src/enterprise/services/account.service.ts delete(), move the cancelSubscription call to after queryRunner.commitTransaction() (alongside removeFolderFromStorage), so the external/irreversible Stripe call only happens once the DB deletion is durably committed.",
+          "evidence": "+        // Step 6: Cancel Stripe Subscription\n+        await this.identityManager.cancelSubscription(organizaiton.subscriptionId)\n+\n+        await queryRunner.commitTransaction()",
+          "recurrence": 1,
+          "confidence_runs": "1/5",
+          "verify_why": "Diff literally shows `await this.identityManager.cancelSubscription(organizaiton.subscriptionId)` immediately before `await queryRunner.commitTransaction()` (Step 6); Stripe cancel is irreversible external state, so a commit failure rolls back the DB deletes/anonymization while the subscription stays cancelled \u2014 a genuine billing/account consistency bug, not style. Major (not critical) since it only triggers on the rare commit failure and affects the deleting user's own org."
+        },
+        {
+          "type": "bug",
+          "severity": "major",
+          "title": "Stripe subscription is cancelled inside the DB transaction before commit, so a failed commit leaves the customer's subscription irreversibly cancelled while the account still exists.",
+          "why": "External irreversible side effect executes before commitTransaction(); if the commit then fails, the DB rolls back but the Stripe cancellation cannot, producing an inconsistent billing/account state.",
+          "fix": "In packages/server/src/enterprise/services/account.service.ts, move `await this.identityManager.cancelSubscription(organizaiton.subscriptionId)` to AFTER `await queryRunner.commitTransaction()` (alongside removeFolderFromStorage), or otherwise ensure the Stripe call only runs once the DB deletion is durably committed.",
+          "evidence": "+        // Step 6: Cancel Stripe Subscription\n+        await this.identityManager.cancelSubscription(organizaiton.subscriptionId)\n+\n+        await queryRunner.commitTransaction()",
+          "recurrence": 1,
+          "confidence_runs": "1/5",
+          "verify_why": "Diff shows `await this.identityManager.cancelSubscription(organizaiton.subscriptionId)` (Step 6) executing immediately before `await queryRunner.commitTransaction()`; the irreversible Stripe cancellation runs inside the still-open transaction, so a commit failure rolls back the DB while the cancellation stands, producing inconsistent billing/account state."
+        },
+        {
+          "type": "bug",
+          "severity": "major",
+          "title": "Irreversible Stripe cancellation runs inside the DB transaction before commit, risking billing/DB inconsistency",
+          "why": "If commitTransaction() throws, the controller rolls back the DB so the account and org survive, but the subscription has already been cancelled at Stripe \u2014 org left with no active subscription and no way to auto-recover.",
+          "fix": "In packages/server/src/enterprise/services/account.service.ts move the Stripe cancellation (this.identityManager.cancelSubscription) to AFTER queryRunner.commitTransaction() succeeds (alongside removeFolderFromStorage), so the irreversible external call only fires once the DB state is durably committed.",
+          "evidence": "+        // Step 6: Cancel Stripe Subscription\n+        await this.identityManager.cancelSubscription(organizaiton.subscriptionId)\n+\n+        await queryRunner.commitTransaction()",
+          "recurrence": 1,
+          "confidence_runs": "1/5",
+          "verify_why": "Diff literally shows `await this.identityManager.cancelSubscription(organizaiton.subscriptionId)` immediately before `await queryRunner.commitTransaction()`; the irreversible external Stripe cancel executes inside the transaction, so a commit failure (rolled back in the controller's catch) leaves the account/org intact but the subscription already cancelled \u2014 a real billing/DB inconsistency, gated on the edge case of commit failure so major, not critical."
+        },
+        {
+          "type": "bug",
+          "severity": "major",
+          "title": "Stripe subscription is cancelled inside the open DB transaction, so a commit failure leaves billing cancelled but account undeleted",
+          "why": "The external Stripe call runs before commitTransaction(); if the commit then fails and the catch rolls back, the subscription is already cancelled while all user/workspace data is restored \u2014 inconsistent billing state, plus the network call holds DB locks.",
+          "fix": "In packages/server/src/enterprise/services/account.service.ts delete(), move the `this.identityManager.cancelSubscription(...)` call to AFTER `queryRunner.commitTransaction()` (alongside removeFolderFromStorage), or make cancellation idempotent/compensatable so a rollback can be reconciled.",
+          "evidence": "        // Step 6: Cancel Stripe Subscription\n+        await this.identityManager.cancelSubscription(organizaiton.subscriptionId)\n+\n+        await queryRunner.commitTransaction()",
+          "recurrence": 1,
+          "confidence_runs": "1/5",
+          "verify_why": "Diff shows `await this.identityManager.cancelSubscription(organizaiton.subscriptionId)` executed before `await queryRunner.commitTransaction()` inside the started transaction; a commit failure triggers the controller's rollbackTransaction, restoring all data while the Stripe subscription is already irreversibly cancelled \u2014 genuine billing/state inconsistency plus a network call holding DB locks."
+        }
+      ],
+      "reached": 772,
+      "touches_sensitive": true
+    }
+  ]
+}

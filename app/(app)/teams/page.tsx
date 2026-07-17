@@ -1,121 +1,73 @@
+/**
+ * /teams — the entry point into the performance Dashboard (change 172, Decision 1).
+ * Rebuilt on the PR-evidence lineage (getCycleContext), NOT the old Esha performance_cycles model.
+ * Lists the tracked team and its in-scope Linear cycles {current, -1, -2}; clicking a cycle opens the
+ * cycle-scoped Dashboard (/overview?cycle=N). The empty cycle (e.g. 11) shows honestly as 0/0.
+ */
 import Link from "next/link";
-import { listTeams } from "@/lib/queries";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+import { accountFor, AUTH_COOKIE } from "@/lib/auth";
+import { getCycleContext, REAL_REPO } from "@/lib/realReport";
+import { listRosterEmployees } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+export const metadata = { title: "Teams · HR Bot" };
 
-export const metadata = {
-  title: "Teams · HR Bot",
-};
-
-function relTime(iso: string): string {
-  const t = new Date(iso).getTime();
-  const diff = Date.now() - t;
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
-}
-
-function statusPill(team: { latest_days_left: number | null; n_low: number; n_employees: number }) {
-  const daysLeft = team.latest_days_left;
-  const lowFraction = team.n_employees > 0 ? team.n_low / team.n_employees : 0;
-  if (daysLeft === 0) {
-    return (
-      <span className="inline-flex items-center gap-1 text-[11px] uppercase tracking-wide
-                       bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200 rounded-full px-2 py-0.5">
-        End of cycle
-      </span>
-    );
-  }
-  if (daysLeft !== null && daysLeft > 0) {
-    const tone = lowFraction > 0.5 ? "bg-amber-50 text-amber-800 ring-amber-200"
-                                    : "bg-emerald-50 text-emerald-700 ring-emerald-200";
-    return (
-      <span className={`inline-flex items-center gap-1 text-[11px] uppercase tracking-wide ${tone}
-                       ring-1 ring-inset rounded-full px-2 py-0.5`}>
-        {daysLeft} day{daysLeft !== 1 ? "s" : ""} left
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1 text-[11px] uppercase tracking-wide
-                     bg-stone-100 text-slate-600 ring-1 ring-inset ring-stone-300 rounded-full px-2 py-0.5">
-      Idle
-    </span>
-  );
-}
+const fmt = (s: string | null) => (s ? new Date(s).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—");
 
 export default async function TeamsPage() {
-  const teams = await listTeams();
+  const acct = accountFor((await cookies()).get(AUTH_COOKIE)?.value);
+  if (!acct) redirect("/login");
+  if (acct.role !== "hr") redirect("/me");
+
+  const [cycle, roster] = await Promise.all([getCycleContext(), listRosterEmployees()]);
+  const live = cycle.current != null;
 
   return (
-    <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
-      <div className="flex items-end justify-between mb-8">
-        <div>
-          <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Teams</h1>
-          <p className="mt-1 text-slate-500 text-sm">
-            Every team that&apos;s ever posted a cycle report through Esha bot.
-            Click a card to drill into the team&apos;s employees + cycle history.
-          </p>
-        </div>
-        <div className="text-xs text-slate-400">
-          {teams.length} team{teams.length !== 1 ? "s" : ""}
-        </div>
+    <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-10 space-y-5">
+      <div>
+        <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Teams</h1>
+        <p className="mt-1 text-slate-500 text-[14px]">Pick a team and cycle to open its performance Dashboard. Scope is the current + 2 prior Linear cycles.</p>
       </div>
 
-      {teams.length === 0 ? (
-        <div className="text-center py-20 text-slate-500">
-          <div className="text-5xl mb-3">📭</div>
-          <div className="text-lg">No teams yet.</div>
-          <div className="text-sm mt-2">
-            When Esha posts a cycle report in the Slack channel, it&apos;ll appear here.
+      <div className="rounded-2xl border border-stone-200 bg-white overflow-hidden">
+        <div className="flex items-center justify-between gap-4 p-5 bg-gradient-to-br from-[#AE00D0] to-[#7B5AFF] text-white">
+          <div>
+            <div className="text-xl font-semibold">Agent Builder</div>
+            <div className="text-[12.5px] text-white/85 mt-0.5">{REAL_REPO} · {roster.length} on roster</div>
           </div>
+          <Link href="/overview" className="rounded-full bg-white text-[#7B5AFF] font-medium text-[13px] px-4 py-1.5 hover:bg-white/90">Open Dashboard →</Link>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-          {teams.map((t) => (
-            <Link
-              key={t.team}
-              href={`/teams/${encodeURIComponent(t.team)}`}
-              className="block bg-white rounded-xl border border-stone-200 hover:border-[#AE00D0]
-                         hover:shadow-md transition p-6 group"
-            >
-              <div className="flex items-start justify-between mb-3">
-                <h3 className="text-lg font-semibold text-slate-900 group-hover:text-[#AE00D0]">
-                  {t.team}
-                </h3>
-                {statusPill(t)}
-              </div>
 
-              <div className="text-xs text-slate-500 mb-4">
-                Latest cycle: <span className="text-slate-700 font-medium">{t.latest_cycle_name}</span>
-                <span className="text-slate-400"> · {relTime(t.latest_cycle_received_at)}</span>
-              </div>
+        {live ? (
+          <div className="p-4">
+            <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-2">Cycles in scope</div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {cycle.windows.map((w) => (
+                <Link key={w.number} href={w.number === cycle.current ? "/overview" : `/overview?cycle=${w.number}`}
+                  className="group rounded-xl border border-stone-200 hover:border-[#AE00D0] hover:shadow-sm transition p-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-lg font-semibold text-slate-900">Cycle {w.number}</span>
+                    {w.isCurrent && <span className="text-[10px] uppercase tracking-wider rounded-full bg-emerald-100 text-emerald-700 px-2 py-0.5">current</span>}
+                  </div>
+                  <div className="text-[12px] text-slate-500 mt-1">{fmt(w.startsAt)} – {fmt(w.endsAt)}</div>
+                  <div className="mt-2 text-[13px] text-slate-600 tabular-nums">
+                    {w.count === 0 ? <span className="text-slate-400">no issues (carried into current)</span>
+                      : <>{w.count} issue{w.count === 1 ? "" : "s"}{w.inherited > 0 ? ` · ${w.inherited} carried` : ""}</>}
+                  </div>
+                  <div className="mt-2 text-[12px] text-[#AE00D0] opacity-0 group-hover:opacity-100 transition">Open cycle Dashboard →</div>
+                </Link>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="p-8 text-center text-slate-400 text-sm">No cycle data yet — the analyzer has not run for this team.</div>
+        )}
+      </div>
 
-              <div className="mt-6 pt-4 border-t border-stone-100 flex items-center justify-between text-xs text-slate-500">
-                <div>
-                  {t.active_pm ? (
-                    <>
-                      <span className="text-slate-400 uppercase tracking-wider mr-1">PM</span>
-                      <span className="text-slate-800 font-medium">{t.active_pm}</span>
-                    </>
-                  ) : (
-                    <span className="text-slate-400 italic">No PM yet</span>
-                  )}
-                </div>
-                <div className="text-slate-400">
-                  {t.total_cycles} cycle{t.total_cycles !== 1 ? "s" : ""} · {t.n_employees} member{t.n_employees !== 1 ? "s" : ""}
-                </div>
-              </div>
-            </Link>
-          ))}
-        </div>
-      )}
+      <p className="text-[11px] text-slate-400 text-center">Advisory — a human always decides; this is never a ranked leaderboard.</p>
     </main>
   );
 }

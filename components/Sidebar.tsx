@@ -27,9 +27,12 @@ const NAV: NavSection[] = [
   {
     title: "Performance",
     items: [
+      // The two-page product (change 172): Dashboard (team + per-cycle) → Teams entry → Employees detail.
+      { href: "/overview",  label: "Dashboard", Icon: AwardIcon },
       { href: "/teams",     label: "Teams",     Icon: TeamsIcon },
       { href: "/employees", label: "Employees", Icon: EmployeesIcon },
-      { href: "/map",       label: "Issue Map", Icon: MapIcon },
+      // PM Desk (changes/235): unmarked ongoing issues (no SP / no priority) per owner, PM/HR only.
+      { href: "/pm",        label: "PM Desk",   Icon: FlaskIcon },
     ],
   },
   {
@@ -48,22 +51,38 @@ const NAV: NavSection[] = [
     ],
   },
   {
-    title: "Lab",
+    title: "Hiring",
     items: [
-      { href: "/lab", label: "Agent Lab", Icon: FlaskIcon },
+      { href: "/recruitment", label: "Recruitment", Icon: FileTextIcon },
+    ],
+  },
+  {
+    title: "Tools",
+    items: [
+      { href: "/analysis", label: "Repository Analysis", Icon: MapIcon },
     ],
   },
 ];
+// Retired from nav (change 172, folded into the two-page Dashboard/Employee model):
+// /report (Engineer Report → Dashboard People list + per-employee page), /performance & /trial
+// (trial-only), /loop (demo fixture), /map (Issue Map). Reachable-by-URL retirees redirect where noted.
 
-// Flatten for the dock-style hover effect — we need a single global index
-// so neighbouring items (across section boundaries) can also react.
-const FLAT_ITEMS: NavItem[] = NAV.flatMap((s) => s.items);
+// Employees see only their own page.
+const EMPLOYEE_NAV: NavSection[] = [
+  { title: "You", items: [{ href: "/me", label: "My Report", Icon: EmployeesIcon }] },
+];
 
 const STORAGE_KEY = "hr-bot-sidebar-collapsed";
 
 
-export function Sidebar({ userName, userRole }: { userName?: string; userRole?: string }) {
+export function Sidebar({ userName, userRole, role }: { userName?: string; userRole?: string; role?: "hr" | "employee" }) {
+  const nav = role === "employee" ? EMPLOYEE_NAV : NAV;
   const pathname = usePathname();
+
+  async function logout() {
+    try { await fetch("/api/logout", { method: "POST" }); } catch {}
+    window.location.href = "/login";
+  }
   const [collapsed, setCollapsed] = useState(false);
   // Dock-style hover: which flat-index item is the mouse over right now?
   // null when nothing is hovered.  Only applied when sidebar is collapsed.
@@ -112,7 +131,7 @@ export function Sidebar({ userName, userRole }: { userName?: string; userRole?: 
   // Compact nav used inside the mobile drawer (always expanded, no dock).
   const mobileNav = (
     <nav className="flex-1 overflow-y-auto px-3 py-4">
-      {NAV.map((section) => (
+      {nav.map((section) => (
         <div key={section.title} className="mb-6">
           <div className="px-3 mb-2 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">
             {section.title}
@@ -199,6 +218,7 @@ export function Sidebar({ userName, userRole }: { userName?: string; userRole?: 
           <div className="text-slate-500">Signed in as</div>
           <div className="text-slate-900 font-medium mt-0.5 truncate">{userName ?? "—"}</div>
           <div className="text-[10px] text-slate-400 mt-0.5 uppercase tracking-wider">{userRole ?? "viewer"}</div>
+          <button onClick={logout} className="mt-2 w-full text-center py-1.5 rounded-md bg-stone-100 hover:bg-stone-200 text-slate-700 text-[12px] font-medium">Log out</button>
         </div>
       </aside>
 
@@ -248,14 +268,15 @@ export function Sidebar({ userName, userRole }: { userName?: string; userRole?: 
         </button>
       </div>
 
-      {/* Nav */}
+      {/* Nav — natural height so the footer sits right below the last section
+          (no flex-1: the empty space falls below the footer, not above it). */}
       <nav className={clsx(
-        "flex-1 overflow-y-auto overflow-x-visible",
+        "overflow-x-visible",
         collapsed ? "py-3 px-2" : "py-4 px-3",
       )}>
-        {NAV.map((section, sIdx) => {
+        {nav.map((section, sIdx) => {
           // Index offset for this section in the flat list (for dock hover).
-          const offset = NAV.slice(0, sIdx).reduce((n, s) => n + s.items.length, 0);
+          const offset = nav.slice(0, sIdx).reduce((n, s) => n + s.items.length, 0);
           return (
             <div key={section.title} className={collapsed ? "mb-2" : "mb-6"}>
               {!collapsed && (
@@ -354,12 +375,10 @@ export function Sidebar({ userName, userRole }: { userName?: string; userRole?: 
         collapsed ? "px-2 py-3" : "px-4 py-3",
       )}>
         {collapsed ? (
-          <div
-            title={`${userName ?? "—"} · ${userRole ?? "viewer"}`}
-            className="mx-auto w-10 h-10 rounded-full bg-gradient-to-br from-[#AE00D0] to-[#7B5AFF] text-white font-bold flex items-center justify-center text-sm shadow-sm"
-          >
+          <button onClick={logout} title={`${userName ?? "—"} · ${userRole ?? "viewer"} — click to log out`}
+            className="mx-auto w-10 h-10 rounded-full bg-gradient-to-br from-[#AE00D0] to-[#7B5AFF] text-white font-bold flex items-center justify-center text-sm shadow-sm">
             {(userName ?? "U").charAt(0).toUpperCase()}
-          </div>
+          </button>
         ) : (
           <>
             <div className="text-slate-500">Signed in as</div>
@@ -369,6 +388,7 @@ export function Sidebar({ userName, userRole }: { userName?: string; userRole?: 
             <div className="text-[10px] text-slate-400 mt-0.5 uppercase tracking-wider">
               {userRole ?? "viewer"}
             </div>
+            <button onClick={logout} className="mt-2 w-full text-center py-1.5 rounded-md bg-stone-100 hover:bg-stone-200 text-slate-700 text-[12px] font-medium">Log out</button>
           </>
         )}
       </div>

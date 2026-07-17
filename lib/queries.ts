@@ -1514,6 +1514,98 @@ export async function listAllEmployees(filter?: { search?: string; team?: string
   `, params);
 }
 
+/** Roster-first listing: EVERY active employee in the master table (so people entered via the HR form show
+ *  up immediately, before any cycle data exists — the null base). Latest cycle score is LEFT-joined and may
+ *  be null. Includes the identity fields (github_login / linear_email) HR enters. Used by /employees. */
+export type RosterEmployeeRow = {
+  employee_id: string;
+  employee_name: string;
+  email: string | null;
+  emp_id: string | null;
+  designation: string | null;
+  department: string | null;
+  github_login: string | null;
+  linear_email: string | null;
+  teams_seen: string[];
+  total_cycles: number;
+  latest_cycle_name: string | null;
+  latest_received_at: string | null;
+  latest_classification: string | null;
+  latest_final_score: number | null;
+};
+
+export async function listRosterEmployees(filter?: { search?: string; department?: string }): Promise<RosterEmployeeRow[]> {
+  const params: unknown[] = [];
+  const where: string[] = ["e.is_active"];
+  if (filter?.search) { params.push(`%${filter.search.toLowerCase()}%`); where.push(`LOWER(e.name) LIKE $${params.length}`); }
+  if (filter?.department) { params.push(filter.department); where.push(`COALESCE(ep.department,'') = $${params.length}`); }
+  const whereSQL = `WHERE ${where.join(" AND ")}`;
+
+  return await q<RosterEmployeeRow>(`
+    WITH cyc AS (
+      SELECT ces.employee_id,
+             COUNT(DISTINCT ces.cycle_id)::int AS total_cycles,
+             ARRAY_AGG(DISTINCT pc.team) FILTER (WHERE pc.team IS NOT NULL) AS teams_seen
+      FROM cycle_employee_scores ces JOIN performance_cycles pc ON pc.id = ces.cycle_id
+      WHERE ces.employee_id IS NOT NULL GROUP BY ces.employee_id
+    ),
+    latest AS (
+      SELECT DISTINCT ON (ces.employee_id)
+             ces.employee_id, pc.cycle_name AS latest_cycle_name, pc.received_at AS latest_received_at,
+             ces.classification AS latest_classification, ces.final_score AS latest_final_score
+      FROM cycle_employee_scores ces JOIN performance_cycles pc ON pc.id = ces.cycle_id
+      WHERE ces.employee_id IS NOT NULL
+      ORDER BY ces.employee_id, ces.snapshot_at DESC NULLS LAST, pc.received_at DESC
+    )
+    SELECT e.id AS employee_id, e.name AS employee_name, e.email,
+           ep.emp_id, ep.designation, ep.department, ep.github_login, ep.linear_email,
+           COALESCE(cyc.teams_seen, ARRAY[]::text[]) AS teams_seen,
+           COALESCE(cyc.total_cycles, 0) AS total_cycles,
+           latest.latest_cycle_name, latest.latest_received_at::text,
+           latest.latest_classification, latest.latest_final_score
+    FROM employees e
+    LEFT JOIN employee_profiles ep ON ep.employee_id = e.id
+    LEFT JOIN cyc    ON cyc.employee_id::text    = e.id::text
+    LEFT JOIN latest ON latest.employee_id::text = e.id::text
+    ${whereSQL}
+    ORDER BY e.name ASC
+  `, params);
+}
+
+/** Load one employee (master + profile) for the edit form. */
+export type EmployeeEditRow = {
+  employee_id: string; name: string; email: string | null; role: string | null; manager_email: string | null;
+  is_active: boolean; emp_id: string | null; designation: string | null; department: string | null;
+  joining_date: string | null; location: string | null; pronoun: string | null;
+  github_login: string | null; linear_email: string | null; linear_user_id: string | null;
+};
+export async function getEmployeeForEdit(id: string): Promise<EmployeeEditRow | null> {
+  const rows = await q<EmployeeEditRow>(`
+    SELECT e.id AS employee_id, e.name, e.email, e.role, e.manager_email, e.is_active,
+           ep.emp_id, ep.designation, ep.department, ep.joining_date::text, ep.location, ep.pronoun,
+           ep.github_login, ep.linear_email, ep.linear_user_id
+    FROM employees e LEFT JOIN employee_profiles ep ON ep.employee_id = e.id
+    WHERE e.id = $1`, [id]);
+  return rows[0] ?? null;
+}
+
+/** Look up a roster employee by name (master table) — used to render the null-base profile for people
+ *  who have no cycle data yet (so they get a structured profile instead of a 404). */
+export type EmployeeMasterRow = {
+  employee_id: string; name: string; email: string | null; is_active: boolean;
+  designation: string | null; department: string | null; joining_date: string | null;
+  location: string | null; github_login: string | null; linear_email: string | null;
+};
+export async function getEmployeeByName(name: string): Promise<EmployeeMasterRow | null> {
+  const rows = await q<EmployeeMasterRow>(`
+    SELECT e.id AS employee_id, e.name, e.email, e.is_active,
+           ep.designation, ep.department, ep.joining_date::text, ep.location, ep.github_login, ep.linear_email
+    FROM employees e LEFT JOIN employee_profiles ep ON ep.employee_id = e.id
+    WHERE LOWER(e.name) = LOWER($1) AND e.is_active
+    ORDER BY e.created_at LIMIT 1`, [name]);
+  return rows[0] ?? null;
+}
+
 /** Distinct teams + departments for filter dropdowns. */
 export async function getFilterOptions(): Promise<{ teams: string[]; departments: string[] }> {
   const [teamRows, deptRows] = await Promise.all([

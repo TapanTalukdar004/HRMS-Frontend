@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Logo } from "@/components/Logo";
 
 export default function LoginPage() {
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -18,11 +19,12 @@ export default function LoginPage() {
       const res = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ username, password }),
       });
       if (res.ok) {
-        // Full reload so middleware re-evaluates with the new cookie.
-        window.location.href = "/";
+        const body = await res.json().catch(() => ({}));
+        // HR/PM → full report; employees → their own page.
+        window.location.href = body?.role === "employee" ? "/me" : "/report";
       } else {
         const body = await res.json().catch(() => ({}));
         setError(body?.error ?? "Login failed");
@@ -49,10 +51,25 @@ export default function LoginPage() {
             Sign in to continue
           </h1>
           <p className="text-xs text-slate-500 text-center mb-6">
-            This dashboard contains internal performance data. Enter the team password.
+            Internal performance data. Sign in with your name (HR / PM, or your first name).
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label htmlFor="user" className="block text-xs font-medium text-slate-600 mb-1.5">
+                Username
+              </label>
+              <input
+                id="user"
+                type="text"
+                autoFocus
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full px-3 py-2.5 rounded-lg border border-stone-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#AE00D0]/30 focus:border-[#AE00D0]"
+                placeholder="hr · pm · komal · shruti …"
+              />
+            </div>
             <div>
               <label htmlFor="pw" className="block text-xs font-medium text-slate-600 mb-1.5">
                 Password
@@ -60,7 +77,6 @@ export default function LoginPage() {
               <input
                 id="pw"
                 type="password"
-                autoFocus
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full px-3 py-2.5 rounded-lg border border-stone-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#AE00D0]/30 focus:border-[#AE00D0]"
@@ -76,7 +92,7 @@ export default function LoginPage() {
 
             <button
               type="submit"
-              disabled={loading || !password}
+              disabled={loading || !username || !password}
               className="w-full py-2.5 rounded-lg bg-gradient-to-r from-[#AE00D0] to-[#7B5AFF] text-white text-sm font-medium disabled:opacity-50 transition-opacity"
             >
               {loading ? "Signing in…" : "Sign in"}

@@ -96,6 +96,30 @@ export type LabRun = {
   notes: string | null;
 };
 
+/** Cross-repo connection check: one issue delivered by 2+ PRs/repos. */
+export type LabCluster = {
+  id: string;
+  issue_key: string;
+  repos: string[] | null;
+  pr_refs: string[] | null;            // e.g. ['repo-a#3', 'repo-b#1']
+  integration_status: string | null;   // verified | pending | mismatch
+  combined_quality: number | null;     // 0..10
+  confidence: number | null;
+  connection_notes: string | null;
+  cross_defects: string[] | null;
+  /** How the cross-repo verdict moves the number (demo/lab only). */
+  score_detail: {
+    title?: string | null;
+    members: { repo: string; pr: number; quality: number | null }[];
+    avg_pr_quality: number | null;
+    integration_factor: number | null;
+    delivered_score: number | null;
+  } | null;
+  model_version: string | null;
+  run_date: string | null;
+  created_at: string | null;
+};
+
 export type LabData = {
   issues: LabIssue[];
   /** Latest issue_evidence snapshot per issue_key for the repo. */
@@ -125,6 +149,7 @@ export async function getLabData(repo: string): Promise<LabData> {
         SELECT id, issue_key, title, description, label, status, priority,
                estimate, assignee, relates_to, url, updated_at
         FROM lab_linear_issues
+        WHERE workspace = 'practice'
         ORDER BY issue_key
       `),
       q<LabEvidence>(`
@@ -198,6 +223,27 @@ export async function getLabData(repo: string): Promise<LabData> {
   const lastRun = runRows.length > 0 ? { ...runRows[0], items: num(runRows[0].items) } : null;
 
   return { issues, evidenceByIssue, assessmentByIssue, prs, lastRun };
+}
+
+/**
+ * Cross-repo clusters — latest connection-check verdict per issue_key.
+ * Spans all repos (a cluster is, by definition, more than one), so this is a
+ * separate fetch from the repo-scoped getLabData.
+ */
+export async function getClusters(): Promise<LabCluster[]> {
+  const rows = await q<LabCluster>(`
+    SELECT DISTINCT ON (issue_key)
+           id, issue_key, repos, pr_refs, integration_status,
+           combined_quality, confidence, connection_notes, cross_defects,
+           score_detail, model_version, run_date, created_at
+    FROM issue_cluster
+    ORDER BY issue_key, run_date DESC, created_at DESC
+  `);
+  return rows.map((r) => ({
+    ...r,
+    combined_quality: num(r.combined_quality),
+    confidence: num(r.confidence),
+  }));
 }
 
 // ─── Scoring helpers (pure, deterministic) ──────────────────────────────────

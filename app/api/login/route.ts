@@ -1,46 +1,32 @@
 import { NextResponse } from "next/server";
+import { ACCOUNTS, SIMPLE_PASSWORD, AUTH_COOKIE } from "@/lib/auth";
 
 /**
- * Verifies the shared dashboard password and, on success, sets the
- * httpOnly auth cookie that middleware.ts checks.
- *
- * Env vars (set in Vercel):
- *   DASHBOARD_PASSWORD     — what HR types on the login page
- *   DASHBOARD_AUTH_TOKEN   — long random secret; the cookie value
+ * Per-user login. Verifies username + the shared simple password (pass123 for now)
+ * and sets an httpOnly cookie with the username. middleware.ts enforces role access.
  */
 export async function POST(req: Request) {
-  let password = "";
+  let username = "", password = "";
   try {
     const body = await req.json();
+    username = String(body?.username ?? "").trim().toLowerCase();
     password = String(body?.password ?? "");
   } catch {
     return NextResponse.json({ error: "bad request" }, { status: 400 });
   }
 
-  const expected = process.env.DASHBOARD_PASSWORD;
-  const token = process.env.DASHBOARD_AUTH_TOKEN;
-  if (!expected || !token) {
-    return NextResponse.json(
-      { error: "auth not configured on server" },
-      { status: 500 },
-    );
+  const account = ACCOUNTS[username];
+  if (!account || password !== SIMPLE_PASSWORD) {
+    return NextResponse.json({ error: "incorrect username or password" }, { status: 401 });
   }
 
-  // Constant-ish comparison (length check + equality). Good enough for a
-  // shared-password gate; not a high-value secret.
-  if (password.length !== expected.length || password !== expected) {
-    return NextResponse.json({ error: "incorrect password" }, { status: 401 });
-  }
-
-  const res = NextResponse.json({ ok: true });
-  res.cookies.set(COOKIE, token, {
+  const res = NextResponse.json({ ok: true, role: account.role });
+  res.cookies.set(AUTH_COOKIE, username, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     path: "/",
-    maxAge: 60 * 60 * 24 * 30, // 30 days
+    maxAge: 60 * 60 * 24 * 30,
   });
   return res;
 }
-
-const COOKIE = "hrbot_auth";
